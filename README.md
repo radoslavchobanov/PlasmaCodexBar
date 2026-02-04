@@ -1,10 +1,9 @@
 # PlasmaCodexBar
 
-<p align="center">
-  <img src="https://img.shields.io/badge/version-1.0.0-blue.svg" alt="Version">
-  <img src="https://img.shields.io/badge/KDE_Plasma-6-blue.svg" alt="Plasma 6">
-  <img src="https://img.shields.io/badge/license-MIT-orange.svg" alt="License">
-</p>
+
+[![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-green)](https://www.python.org/)
+[![KDE Plasma 6](https://img.shields.io/badge/KDE_Plasma-6-blue)](https://kde.org/plasma-desktop/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
 
 A native KDE Plasma 6 system tray widget for monitoring AI subscription usage. Inspired by [CodexBar](https://github.com/steipete/CodexBar) for macOS.
 
