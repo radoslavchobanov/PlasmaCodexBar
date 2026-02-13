@@ -90,7 +90,7 @@ ColumnLayout {
                 title: "Weekly"
                 percentage: providerData ? providerData.weekly_used_pct : 0
                 subtitle: formatResetTime(providerData ? providerData.weekly_reset_time : "")
-                extraInfo: providerData && providerData.pace_status !== "On track" ? providerData.pace_status : ""
+                extraInfo: providerData ? providerData.pace_status : ""
             }
 
             // Models section
@@ -156,26 +156,40 @@ ColumnLayout {
                 }
             }
 
-            // Cost section
+            // Usage section
             ColumnLayout {
                 Layout.fillWidth: true
-                visible: providerData && providerData.is_connected
+                visible: providerData && providerData.is_connected && ((providerData.cost_today_tokens || 0) > 0 || (providerData.cost_30_days_tokens || 0) > 0 || (providerData.cost_30_days || 0) > 0)
                 spacing: Kirigami.Units.smallSpacing
 
                 Kirigami.Separator { Layout.fillWidth: true }
 
                 PlasmaExtras.Heading {
                     level: 4
-                    text: "Cost"
+                    text: "Usage"
                 }
 
                 PlasmaComponents.Label {
-                    text: providerData ? "Today: $ " + (providerData.cost_today || 0).toFixed(2) + " · " + formatTokens(providerData.cost_today_tokens || 0) + " tokens" : ""
+                    text: {
+                        if (!providerData) return ""
+                        var cost = providerData.cost_today || 0
+                        var tokens = providerData.cost_today_tokens || 0
+                        if (cost > 0)
+                            return "Today: $" + cost.toFixed(2) + " · " + formatTokens(tokens) + " tokens"
+                        return "Today: " + formatTokens(tokens) + " tokens"
+                    }
                     opacity: 0.8
                 }
 
                 PlasmaComponents.Label {
-                    text: providerData ? "Last 30 days: $ " + (providerData.cost_30_days || 0).toFixed(2) + " · " + formatTokens(providerData.cost_30_days_tokens || 0) + " tokens" : ""
+                    text: {
+                        if (!providerData) return ""
+                        var cost = providerData.cost_30_days || 0
+                        var tokens = providerData.cost_30_days_tokens || 0
+                        if (cost > 0)
+                            return "Last 30 days: $" + cost.toFixed(2) + " · " + formatTokens(tokens) + " tokens"
+                        return "Last 30 days: " + formatTokens(tokens) + " tokens"
+                    }
                     opacity: 0.8
                 }
             }

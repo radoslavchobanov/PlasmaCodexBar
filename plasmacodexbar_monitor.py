@@ -325,9 +325,9 @@ class ClaudeOAuthFetcher:
             expected_pct = (elapsed_seconds / total_seconds) * 100
             stats.pace_percentage = stats.weekly_used_pct - expected_pct
 
-            if stats.pace_percentage < -10:
+            if stats.pace_percentage < 0:
                 stats.pace_status = f"Behind ({stats.pace_percentage:.0f}%)"
-            elif stats.pace_percentage > 10:
+            elif stats.pace_percentage > 0:
                 stats.pace_status = f"Ahead (+{stats.pace_percentage:.0f}%)"
             else:
                 stats.pace_status = "On track"
@@ -376,6 +376,7 @@ class CodexOAuthFetcher:
     def __init__(self):
         self.auth_file = CODEX_DIR / "auth.json"
         self.config_file = CODEX_DIR / "config.toml"
+        self.sessions_dir = CODEX_DIR / "sessions"
 
     def _load_credentials(self) -> Optional[dict]:
         """Load OAuth credentials from ~/.codex/auth.json"""
@@ -659,14 +660,94 @@ class CodexOAuthFetcher:
             expected_pct = (elapsed_seconds / total_seconds) * 100
 
             stats.pace_percentage = stats.weekly_used_pct - expected_pct
-            if stats.pace_percentage < -10:
+            if stats.pace_percentage < 0:
                 stats.pace_status = f"Behind ({stats.pace_percentage:.0f}%)"
-            elif stats.pace_percentage > 10:
+            elif stats.pace_percentage > 0:
                 stats.pace_status = f"Ahead (+{stats.pace_percentage:.0f}%)"
             else:
                 stats.pace_status = "On track"
 
+        # Load token stats from local session files
+        local_stats = self._load_local_cost_stats()
+        stats.cost_today_tokens = local_stats["cost_today_tokens"]
+        stats.cost_30_days_tokens = local_stats["cost_30_days_tokens"]
+
         return stats
+
+    def _load_local_cost_stats(self) -> dict:
+        """Load token stats from Codex CLI session files.
+
+        Session files at ~/.codex/sessions/YYYY/MM/DD/*.jsonl contain
+        token_count events with cumulative total_token_usage per session.
+        """
+        result = {
+            "cost_today": 0.0,
+            "cost_today_tokens": 0,
+            "cost_30_days": 0.0,
+            "cost_30_days_tokens": 0,
+        }
+
+        if not self.sessions_dir.exists():
+            return result
+
+        try:
+            today = datetime.now().date()
+            thirty_days_ago = today - timedelta(days=30)
+
+            for year_dir in sorted(self.sessions_dir.iterdir()):
+                if not year_dir.is_dir() or not year_dir.name.isdigit():
+                    continue
+                for month_dir in sorted(year_dir.iterdir()):
+                    if not month_dir.is_dir() or not month_dir.name.isdigit():
+                        continue
+                    for day_dir in sorted(month_dir.iterdir()):
+                        if not day_dir.is_dir() or not day_dir.name.isdigit():
+                            continue
+
+                        try:
+                            dir_date = datetime(
+                                int(year_dir.name),
+                                int(month_dir.name),
+                                int(day_dir.name)
+                            ).date()
+                        except ValueError:
+                            continue
+
+                        if dir_date < thirty_days_ago:
+                            continue
+
+                        for session_file in day_dir.glob("*.jsonl"):
+                            tokens = self._get_session_tokens(session_file)
+                            if dir_date == today:
+                                result["cost_today_tokens"] += tokens
+                            result["cost_30_days_tokens"] += tokens
+        except Exception:
+            pass
+
+        return result
+
+    def _get_session_tokens(self, session_file) -> int:
+        """Extract output tokens from the last token_count event in a session file.
+
+        Uses output_tokens only to match Claude's metric (model-generated tokens).
+        """
+        last_output = 0
+        try:
+            with open(session_file, 'r') as f:
+                for line in f:
+                    try:
+                        entry = json.loads(line)
+                        payload = entry.get("payload") or {}
+                        if (entry.get("type") == "event_msg"
+                                and payload.get("type") == "token_count"):
+                            info = payload.get("info") or {}
+                            usage = info.get("total_token_usage") or {}
+                            last_output = usage.get("output_tokens", 0)
+                    except (json.JSONDecodeError, KeyError, TypeError):
+                        continue
+        except Exception:
+            pass
+        return last_output
 
 
 # ============================================================================

@@ -7,6 +7,7 @@ Exposes AI usage data for the KDE Plasma applet
 import json
 import sys
 import os
+import glob
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any
@@ -146,10 +147,12 @@ class ClaudeCollector:
                             expected = (elapsed_secs / total_secs) * 100
                             pace = result["weekly_used_pct"] - expected
 
-                            if pace < -10:
+                            if pace < 0:
                                 result["pace_status"] = f"Behind ({pace:.0f}%)"
-                            elif pace > 10:
+                            elif pace > 0:
                                 result["pace_status"] = f"Ahead (+{pace:.0f}%)"
+                            else:
+                                result["pace_status"] = "On track"
                         except:
                             pass
 
@@ -164,7 +167,51 @@ class ClaudeCollector:
         return result
 
     def _load_cost_stats(self, result: Dict[str, Any]):
-        """Load cost/token stats from Claude Code stats cache"""
+        """Load cost/token stats from Claude session files and stats cache.
+
+        Token counts come from parsing session JSONL files (output_tokens per message).
+        Cost estimates come from the stats-cache.json modelUsage data.
+        """
+        today = datetime.now().date()
+        thirty_days_ago = today - timedelta(days=30)
+
+        # Parse session files for accurate token counts
+        projects_dir = CLAUDE_DIR / "projects"
+        if projects_dir.exists():
+            try:
+                for jsonl in projects_dir.glob("**/*.jsonl"):
+                    try:
+                        mtime = datetime.fromtimestamp(jsonl.stat().st_mtime).date()
+                    except OSError:
+                        continue
+                    if mtime < thirty_days_ago:
+                        continue
+
+                    session_output = 0
+                    try:
+                        with open(jsonl, 'r') as f:
+                            for line in f:
+                                try:
+                                    entry = json.loads(line)
+                                    msg = entry.get("message")
+                                    if not isinstance(msg, dict):
+                                        continue
+                                    usage = msg.get("usage")
+                                    if not isinstance(usage, dict):
+                                        continue
+                                    session_output += usage.get("output_tokens", 0)
+                                except (json.JSONDecodeError, TypeError):
+                                    continue
+                    except OSError:
+                        continue
+
+                    if mtime == today:
+                        result["cost_today_tokens"] += session_output
+                    result["cost_30_days_tokens"] += session_output
+            except Exception:
+                pass
+
+        # Cost estimates from stats-cache.json
         stats_file = CLAUDE_DIR / "stats-cache.json"
         if not stats_file.exists():
             return
@@ -173,29 +220,12 @@ class ClaudeCollector:
             with open(stats_file, 'r') as f:
                 data = json.load(f)
 
-            # Pricing per 1M tokens
             PRICING = {
                 "claude-opus-4-5-20251101": {"input": 15.0, "output": 75.0, "cache_read": 1.5, "cache_write": 18.75},
                 "claude-sonnet-4-5-20250929": {"input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75},
             }
             DEFAULT_PRICING = {"input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75}
 
-            today = datetime.now().date()
-            thirty_days_ago = today - timedelta(days=30)
-
-            # Calculate daily tokens
-            for entry in data.get("dailyModelTokens", []):
-                try:
-                    entry_date = datetime.strptime(entry["date"], "%Y-%m-%d").date()
-                    tokens = sum(entry.get("tokensByModel", {}).values())
-                    if entry_date == today:
-                        result["cost_today_tokens"] = tokens
-                    if entry_date >= thirty_days_ago:
-                        result["cost_30_days_tokens"] += tokens
-                except:
-                    continue
-
-            # Calculate costs from model usage
             model_usage = data.get("modelUsage", {})
             total_cost = 0.0
 
@@ -217,8 +247,8 @@ class ClaudeCollector:
             result["cost_30_days"] = total_cost
             result["cost_today"] = (result["cost_today_tokens"] / 1_000_000) * 5  # Rough estimate
 
-        except Exception as e:
-            pass  # Silently fail for cost stats
+        except Exception:
+            pass
 
 
 class CodexCollector:
@@ -231,6 +261,7 @@ class CodexCollector:
 
     def __init__(self):
         self.auth_file = CODEX_DIR / "auth.json"
+        self.sessions_dir = CODEX_DIR / "sessions"
 
     def collect(self) -> Dict[str, Any]:
         result = {
@@ -249,7 +280,6 @@ class CodexCollector:
             "extra_usage_current": 0,
             "extra_usage_limit": 0,
             "extra_usage_pct": 0,
-            # Cost tracking (not available for Codex yet)
             "cost_today": 0,
             "cost_today_tokens": 0,
             "cost_30_days": 0,
@@ -318,13 +348,113 @@ class CodexCollector:
                                 secondary["reset_at"], tz=timezone.utc
                             ).isoformat()
 
+                    # Calculate pace for secondary window
+                    if result["weekly_reset_time"]:
+                        try:
+                            reset = datetime.fromisoformat(result["weekly_reset_time"].replace('Z', '+00:00'))
+                            now = datetime.now(timezone.utc)
+                            window_seconds = secondary.get("limit_window_seconds", 7 * 24 * 3600)
+                            window_start = reset - timedelta(seconds=window_seconds)
+                            total_secs = float(window_seconds)
+                            elapsed_secs = (now - window_start).total_seconds()
+                            expected = (elapsed_secs / total_secs) * 100
+                            pace = result["weekly_used_pct"] - expected
+
+                            if pace < 0:
+                                result["pace_status"] = f"Behind ({pace:.0f}%)"
+                            elif pace > 0:
+                                result["pace_status"] = f"Ahead (+{pace:.0f}%)"
+                            else:
+                                result["pace_status"] = "On track"
+                        except:
+                            pass
+
         except urllib.error.HTTPError as e:
             result["error_message"] = f"API error: {e.code}"
             result["is_connected"] = True
         except Exception as e:
             result["error_message"] = f"Failed to fetch: {e}"
 
+        # Load token stats from local session files
+        self._load_cost_stats(result)
         return result
+
+    def _load_cost_stats(self, result: Dict[str, Any]):
+        """Load token/cost stats from Codex CLI session files.
+
+        Session files at ~/.codex/sessions/YYYY/MM/DD/*.jsonl contain
+        token_count events with cumulative total_token_usage per session.
+        We read the last token_count from each session to get its totals.
+        """
+        if not self.sessions_dir.exists():
+            return
+
+        try:
+            today = datetime.now().date()
+            thirty_days_ago = today - timedelta(days=30)
+
+            today_tokens = 0
+            thirty_day_tokens = 0
+
+            # Walk date-organized directories: sessions/YYYY/MM/DD/*.jsonl
+            for year_dir in sorted(self.sessions_dir.iterdir()):
+                if not year_dir.is_dir() or not year_dir.name.isdigit():
+                    continue
+                for month_dir in sorted(year_dir.iterdir()):
+                    if not month_dir.is_dir() or not month_dir.name.isdigit():
+                        continue
+                    for day_dir in sorted(month_dir.iterdir()):
+                        if not day_dir.is_dir() or not day_dir.name.isdigit():
+                            continue
+
+                        try:
+                            dir_date = datetime(
+                                int(year_dir.name),
+                                int(month_dir.name),
+                                int(day_dir.name)
+                            ).date()
+                        except ValueError:
+                            continue
+
+                        if dir_date < thirty_days_ago:
+                            continue
+
+                        for session_file in day_dir.glob("*.jsonl"):
+                            session_tokens = self._get_session_tokens(session_file)
+                            if dir_date == today:
+                                today_tokens += session_tokens
+                            thirty_day_tokens += session_tokens
+
+            result["cost_today_tokens"] = today_tokens
+            result["cost_30_days_tokens"] = thirty_day_tokens
+
+        except Exception:
+            pass  # Silently fail for cost stats
+
+    def _get_session_tokens(self, session_file: Path) -> int:
+        """Extract output tokens from the last token_count event in a session file.
+
+        Uses output_tokens only to match Claude's metric (model-generated tokens).
+        This gives a fair comparison since cached/input token accounting differs
+        significantly between providers.
+        """
+        last_output = 0
+        try:
+            with open(session_file, 'r') as f:
+                for line in f:
+                    try:
+                        entry = json.loads(line)
+                        payload = entry.get("payload") or {}
+                        if (entry.get("type") == "event_msg"
+                                and payload.get("type") == "token_count"):
+                            info = payload.get("info") or {}
+                            usage = info.get("total_token_usage") or {}
+                            last_output = usage.get("output_tokens", 0)
+                    except (json.JSONDecodeError, KeyError, TypeError):
+                        continue
+        except Exception:
+            pass
+        return last_output
 
 
 def main():
