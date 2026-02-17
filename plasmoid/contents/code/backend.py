@@ -187,7 +187,7 @@ class ClaudeCollector:
                     if mtime < thirty_days_ago:
                         continue
 
-                    session_output = 0
+                    session_tokens = 0
                     try:
                         with open(jsonl, 'r') as f:
                             for line in f:
@@ -199,15 +199,20 @@ class ClaudeCollector:
                                     usage = msg.get("usage")
                                     if not isinstance(usage, dict):
                                         continue
-                                    session_output += usage.get("output_tokens", 0)
+                                    # Non-cached input + cache creation + output
+                                    session_tokens += (
+                                        usage.get("input_tokens", 0)
+                                        + usage.get("cache_creation_input_tokens", 0)
+                                        + usage.get("output_tokens", 0)
+                                    )
                                 except (json.JSONDecodeError, TypeError):
                                     continue
                     except OSError:
                         continue
 
                     if mtime == today:
-                        result["cost_today_tokens"] += session_output
-                    result["cost_30_days_tokens"] += session_output
+                        result["cost_today_tokens"] += session_tokens
+                    result["cost_30_days_tokens"] += session_tokens
             except Exception:
                 pass
 
@@ -432,13 +437,13 @@ class CodexCollector:
             pass  # Silently fail for cost stats
 
     def _get_session_tokens(self, session_file: Path) -> int:
-        """Extract output tokens from the last token_count event in a session file.
+        """Extract non-cached tokens from the last token_count event in a session file.
 
-        Uses output_tokens only to match Claude's metric (model-generated tokens).
-        This gives a fair comparison since cached/input token accounting differs
-        significantly between providers.
+        Uses (input - cached_input + output) to measure actual new token processing,
+        excluding cache reads. This matches Claude's metric of
+        (input + cache_creation + output).
         """
-        last_output = 0
+        last_effective = 0
         try:
             with open(session_file, 'r') as f:
                 for line in f:
@@ -449,12 +454,15 @@ class CodexCollector:
                                 and payload.get("type") == "token_count"):
                             info = payload.get("info") or {}
                             usage = info.get("total_token_usage") or {}
-                            last_output = usage.get("output_tokens", 0)
+                            input_tokens = usage.get("input_tokens", 0)
+                            cached_tokens = usage.get("cached_input_tokens", 0)
+                            output_tokens = usage.get("output_tokens", 0)
+                            last_effective = (input_tokens - cached_tokens) + output_tokens
                     except (json.JSONDecodeError, KeyError, TypeError):
                         continue
         except Exception:
             pass
-        return last_output
+        return last_effective
 
 
 def main():

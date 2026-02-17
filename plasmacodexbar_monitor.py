@@ -159,7 +159,11 @@ class ClaudeOAuthFetcher:
         return None
 
     def _load_local_cost_stats(self) -> dict:
-        """Load cost/token stats from local Claude Code cache"""
+        """Load cost/token stats from Claude session files and stats cache.
+
+        Token counts come from parsing session JSONL files.
+        Cost estimates come from stats-cache.json modelUsage data.
+        """
         stats = {
             "cost_today": 0.0,
             "cost_today_tokens": 0,
@@ -169,62 +173,87 @@ class ClaudeOAuthFetcher:
             "total_sessions": 0,
         }
 
-        if not self.stats_file.exists():
-            return stats
+        today = datetime.now().date()
+        thirty_days_ago = today - timedelta(days=30)
 
-        try:
-            with open(self.stats_file, 'r') as f:
-                data = json.load(f)
+        # Parse session files for accurate token counts
+        projects_dir = CLAUDE_DIR / "projects"
+        if projects_dir.exists():
+            try:
+                for jsonl in projects_dir.glob("**/*.jsonl"):
+                    try:
+                        mtime = datetime.fromtimestamp(jsonl.stat().st_mtime).date()
+                    except OSError:
+                        continue
+                    if mtime < thirty_days_ago:
+                        continue
 
-            # Pricing per 1M tokens (rough average)
-            PRICING = {
-                "claude-opus-4-5-20251101": {"input": 15.0, "output": 75.0, "cache_read": 1.5, "cache_write": 18.75},
-                "claude-sonnet-4-5-20250929": {"input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75},
-            }
-            DEFAULT_PRICING = {"input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75}
+                    session_tokens = 0
+                    try:
+                        with open(jsonl, 'r') as f:
+                            for line in f:
+                                try:
+                                    entry = json.loads(line)
+                                    msg = entry.get("message")
+                                    if not isinstance(msg, dict):
+                                        continue
+                                    usage = msg.get("usage")
+                                    if not isinstance(usage, dict):
+                                        continue
+                                    session_tokens += (
+                                        usage.get("input_tokens", 0)
+                                        + usage.get("cache_creation_input_tokens", 0)
+                                        + usage.get("output_tokens", 0)
+                                    )
+                                except (json.JSONDecodeError, TypeError):
+                                    continue
+                    except OSError:
+                        continue
 
-            today = datetime.now().date()
-            thirty_days_ago = today - timedelta(days=30)
+                    if mtime == today:
+                        stats["cost_today_tokens"] += session_tokens
+                    stats["cost_30_days_tokens"] += session_tokens
+            except Exception:
+                pass
 
-            # Calculate daily tokens
-            for entry in data.get("dailyModelTokens", []):
-                try:
-                    entry_date = datetime.strptime(entry["date"], "%Y-%m-%d").date()
-                    tokens = sum(entry.get("tokensByModel", {}).values())
-                    if entry_date == today:
-                        stats["cost_today_tokens"] = tokens
-                    if entry_date >= thirty_days_ago:
-                        stats["cost_30_days_tokens"] += tokens
-                except:
-                    continue
+        # Cost estimates and metadata from stats-cache.json
+        if self.stats_file.exists():
+            try:
+                with open(self.stats_file, 'r') as f:
+                    data = json.load(f)
 
-            # Calculate costs from model usage
-            model_usage = data.get("modelUsage", {})
-            total_cost = 0.0
+                PRICING = {
+                    "claude-opus-4-5-20251101": {"input": 15.0, "output": 75.0, "cache_read": 1.5, "cache_write": 18.75},
+                    "claude-sonnet-4-5-20250929": {"input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75},
+                }
+                DEFAULT_PRICING = {"input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75}
 
-            for model_id, usage in model_usage.items():
-                input_tokens = usage.get("inputTokens", 0)
-                output_tokens = usage.get("outputTokens", 0)
-                cache_read = usage.get("cacheReadInputTokens", 0)
-                cache_write = usage.get("cacheCreationInputTokens", 0)
+                model_usage = data.get("modelUsage", {})
+                total_cost = 0.0
 
-                pricing = PRICING.get(model_id, DEFAULT_PRICING)
-                cost = (
-                    (input_tokens / 1_000_000) * pricing["input"] +
-                    (output_tokens / 1_000_000) * pricing["output"] +
-                    (cache_read / 1_000_000) * pricing["cache_read"] +
-                    (cache_write / 1_000_000) * pricing["cache_write"]
-                )
-                total_cost += cost
+                for model_id, usage in model_usage.items():
+                    input_tokens = usage.get("inputTokens", 0)
+                    output_tokens = usage.get("outputTokens", 0)
+                    cache_read = usage.get("cacheReadInputTokens", 0)
+                    cache_write = usage.get("cacheCreationInputTokens", 0)
 
-            stats["cost_30_days"] = total_cost
-            stats["cost_today"] = (stats["cost_today_tokens"] / 1_000_000) * 5  # Rough estimate
+                    pricing = PRICING.get(model_id, DEFAULT_PRICING)
+                    cost = (
+                        (input_tokens / 1_000_000) * pricing["input"] +
+                        (output_tokens / 1_000_000) * pricing["output"] +
+                        (cache_read / 1_000_000) * pricing["cache_read"] +
+                        (cache_write / 1_000_000) * pricing["cache_write"]
+                    )
+                    total_cost += cost
 
-            stats["total_messages"] = data.get("totalMessages", 0)
-            stats["total_sessions"] = data.get("totalSessions", 0)
+                stats["cost_30_days"] = total_cost
+                stats["cost_today"] = (stats["cost_today_tokens"] / 1_000_000) * 5
 
-        except Exception as e:
-            print(f"Error loading local stats: {e}")
+                stats["total_messages"] = data.get("totalMessages", 0)
+                stats["total_sessions"] = data.get("totalSessions", 0)
+
+            except Exception:
+                pass
 
         return stats
 
@@ -727,11 +756,11 @@ class CodexOAuthFetcher:
         return result
 
     def _get_session_tokens(self, session_file) -> int:
-        """Extract output tokens from the last token_count event in a session file.
+        """Extract non-cached tokens from the last token_count event in a session file.
 
-        Uses output_tokens only to match Claude's metric (model-generated tokens).
+        Uses (input - cached_input + output) to measure actual new token processing.
         """
-        last_output = 0
+        last_effective = 0
         try:
             with open(session_file, 'r') as f:
                 for line in f:
@@ -742,12 +771,15 @@ class CodexOAuthFetcher:
                                 and payload.get("type") == "token_count"):
                             info = payload.get("info") or {}
                             usage = info.get("total_token_usage") or {}
-                            last_output = usage.get("output_tokens", 0)
+                            input_tokens = usage.get("input_tokens", 0)
+                            cached_tokens = usage.get("cached_input_tokens", 0)
+                            output_tokens = usage.get("output_tokens", 0)
+                            last_effective = (input_tokens - cached_tokens) + output_tokens
                     except (json.JSONDecodeError, KeyError, TypeError):
                         continue
         except Exception:
             pass
-        return last_output
+        return last_effective
 
 
 # ============================================================================
