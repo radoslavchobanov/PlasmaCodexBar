@@ -7,6 +7,7 @@ Exposes AI usage data for the KDE Plasma applet
 import json
 import sys
 import os
+import re
 import glob
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -23,6 +24,122 @@ CODEX_DIR = Path.home() / ".codex"
 CLAUDE_OAUTH_API_URL = "https://api.anthropic.com/api/oauth/usage"
 CLAUDE_OAUTH_BETA_HEADER = "oauth-2025-04-20"
 CODEX_OAUTH_API_URL = "https://chatgpt.com/backend-api/wham/usage"
+
+
+def _format_model_name(model_id: str) -> str:
+    """Convert raw model ID to a short display name.
+
+    Examples:
+      claude-sonnet-4-5-20250929 → Sonnet 4.5
+      claude-opus-4-6            → Opus 4.6
+      gpt-5.3-codex              → GPT-5.3 Codex
+    """
+    name = re.sub(r'-\d{8}$', '', model_id)  # strip date suffix
+    m = re.match(r'claude-(\w+)-(\d+)-(\d+)$', name, re.IGNORECASE)
+    if m:
+        return f"{m.group(1).title()} {m.group(2)}.{m.group(3)}"
+    m = re.match(r'gpt-([\d.]+)-([\w]+?)(-max)?$', name, re.IGNORECASE)
+    if m:
+        suffix = " Max" if m.group(3) else ""
+        return f"GPT-{m.group(1)} {m.group(2).title()}{suffix}"
+    return name
+
+
+class PricingCache:
+    """Fetches and caches AI model pricing from OpenRouter (24h TTL)."""
+
+    CACHE_FILE = CONFIG_DIR / "pricing_cache.json"
+    OPENROUTER_URL = "https://openrouter.ai/api/v1/models"
+    TTL_HOURS = 24
+
+    # Map normalized local model IDs → OpenRouter model IDs.
+    # Entries marked with "~" use a proxy (different version) since the exact
+    # model isn't on OpenRouter — costs are approximate.
+    MODEL_MAP = {
+        "claude-opus-4-6": "anthropic/claude-opus-4.6",
+        "claude-opus-4-5": "anthropic/claude-opus-4.5",
+        "claude-sonnet-4-6": "anthropic/claude-sonnet-4.6",
+        "claude-sonnet-4-5": "anthropic/claude-sonnet-4.5",
+        "claude-haiku-4-5": "anthropic/claude-haiku-4.5",
+        "gpt-5-3-codex": "openai/gpt-5.2-codex",  # proxy: 5.3 not on OpenRouter
+        "gpt-5-2-codex": "openai/gpt-5.2-codex",
+        "gpt-5-1-codex": "openai/gpt-5.1-codex",
+        "gpt-5-1-codex-max": "openai/gpt-5.1-codex",
+    }
+
+    # Models that use a proxy (approximate pricing)
+    PROXY_MODELS = {"gpt-5-3-codex"}
+
+    def __init__(self):
+        self._prices: Optional[Dict[str, Any]] = None
+
+    def get_price(self, model_id: str) -> Optional[Dict[str, float]]:
+        """Return {"input": float, "output": float} per-token prices in USD, or None."""
+        prices = self._get_prices()
+        if not prices:
+            return None
+        normalized = self._normalize(model_id)
+        or_id = self.MODEL_MAP.get(normalized)
+        if not or_id:
+            return None
+        return prices.get(or_id)
+
+    def is_approximate(self, model_id: str) -> bool:
+        """Return True if pricing uses a proxy model (approximate cost)."""
+        return self._normalize(model_id) in self.PROXY_MODELS
+
+    def _normalize(self, model_id: str) -> str:
+        """Strip date suffix (-YYYYMMDD) and normalize dots to hyphens."""
+        normalized = re.sub(r'-\d{8}$', '', model_id.lower())
+        return normalized.replace('.', '-')
+
+    def _get_prices(self) -> Optional[Dict[str, Any]]:
+        if self._prices is not None:
+            return self._prices
+        self._prices = self._load()
+        return self._prices
+
+    def _load(self) -> Optional[Dict[str, Any]]:
+        """Load from cache if fresh, otherwise fetch from OpenRouter."""
+        if self.CACHE_FILE.exists():
+            try:
+                with open(self.CACHE_FILE, 'r') as f:
+                    cached = json.load(f)
+                fetched_at = datetime.fromisoformat(cached.get("fetched_at", "1970-01-01"))
+                if datetime.now() - fetched_at < timedelta(hours=self.TTL_HOURS):
+                    return cached.get("prices", {})
+            except Exception:
+                pass
+        return self._fetch()
+
+    def _fetch(self) -> Optional[Dict[str, Any]]:
+        """Fetch pricing from OpenRouter and persist to cache file."""
+        try:
+            req = urllib.request.Request(
+                self.OPENROUTER_URL,
+                headers={"Accept": "application/json", "User-Agent": "plasmacodexbar/1.0"}
+            )
+            with urllib.request.urlopen(req, timeout=15) as response:
+                data = json.loads(response.read().decode('utf-8'))
+
+            prices = {}
+            for model in data.get("data", []):
+                model_id = model.get("id", "")
+                pricing = model.get("pricing", {})
+                prompt = pricing.get("prompt")
+                completion = pricing.get("completion")
+                if model_id and prompt is not None and completion is not None:
+                    prices[model_id] = {
+                        "input": float(prompt),
+                        "output": float(completion),
+                    }
+
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            with open(self.CACHE_FILE, 'w') as f:
+                json.dump({"fetched_at": datetime.now().isoformat(), "prices": prices}, f)
+            return prices
+        except Exception:
+            return None
 
 
 class ClaudeCollector:
@@ -51,8 +168,15 @@ class ClaudeCollector:
             # Cost tracking
             "cost_today": 0,
             "cost_today_tokens": 0,
+            "cost_today_input_tokens": 0,
+            "cost_today_output_tokens": 0,
+            "cost_today_by_model": {},
             "cost_30_days": 0,
             "cost_30_days_tokens": 0,
+            "cost_30_days_input_tokens": 0,
+            "cost_30_days_output_tokens": 0,
+            "cost_by_model": {},
+            "cost_approximate": False,
         }
 
         # Load credentials
@@ -167,91 +291,86 @@ class ClaudeCollector:
         return result
 
     def _load_cost_stats(self, result: Dict[str, Any]):
-        """Load cost/token stats from Claude session files and stats cache.
+        """Load cost/token stats from Claude session files.
 
-        Token counts come from parsing session JSONL files (output_tokens per message).
-        Cost estimates come from the stats-cache.json modelUsage data.
+        Token counts and costs come from parsing session JSONL files.
+        Prices are fetched live from OpenRouter (cached 24h).
         """
         today = datetime.now().date()
         thirty_days_ago = today - timedelta(days=30)
+        pricing = PricingCache()
 
-        # Parse session files for accurate token counts
         projects_dir = CLAUDE_DIR / "projects"
-        if projects_dir.exists():
-            try:
-                for jsonl in projects_dir.glob("**/*.jsonl"):
-                    try:
-                        mtime = datetime.fromtimestamp(jsonl.stat().st_mtime).date()
-                    except OSError:
-                        continue
-                    if mtime < thirty_days_ago:
-                        continue
-
-                    session_tokens = 0
-                    try:
-                        with open(jsonl, 'r') as f:
-                            for line in f:
-                                try:
-                                    entry = json.loads(line)
-                                    msg = entry.get("message")
-                                    if not isinstance(msg, dict):
-                                        continue
-                                    usage = msg.get("usage")
-                                    if not isinstance(usage, dict):
-                                        continue
-                                    # Non-cached input + cache creation + output
-                                    session_tokens += (
-                                        usage.get("input_tokens", 0)
-                                        + usage.get("cache_creation_input_tokens", 0)
-                                        + usage.get("output_tokens", 0)
-                                    )
-                                except (json.JSONDecodeError, TypeError):
-                                    continue
-                    except OSError:
-                        continue
-
-                    if mtime == today:
-                        result["cost_today_tokens"] += session_tokens
-                    result["cost_30_days_tokens"] += session_tokens
-            except Exception:
-                pass
-
-        # Cost estimates from stats-cache.json
-        stats_file = CLAUDE_DIR / "stats-cache.json"
-        if not stats_file.exists():
+        if not projects_dir.exists():
             return
 
         try:
-            with open(stats_file, 'r') as f:
-                data = json.load(f)
+            for jsonl in projects_dir.glob("**/*.jsonl"):
+                try:
+                    mtime = datetime.fromtimestamp(jsonl.stat().st_mtime).date()
+                except OSError:
+                    continue
+                # Skip files that are definitely too old (performance optimisation only)
+                if mtime < thirty_days_ago:
+                    continue
 
-            PRICING = {
-                "claude-opus-4-5-20251101": {"input": 15.0, "output": 75.0, "cache_read": 1.5, "cache_write": 18.75},
-                "claude-sonnet-4-5-20250929": {"input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75},
-            }
-            DEFAULT_PRICING = {"input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75}
+                try:
+                    with open(jsonl, 'r') as f:
+                        for line in f:
+                            try:
+                                entry = json.loads(line)
+                                msg = entry.get("message")
+                                if not isinstance(msg, dict):
+                                    continue
+                                usage = msg.get("usage")
+                                if not isinstance(usage, dict):
+                                    continue
 
-            model_usage = data.get("modelUsage", {})
-            total_cost = 0.0
+                                # Use per-message timestamp for accurate date classification
+                                ts = entry.get("timestamp", "")
+                                if ts:
+                                    try:
+                                        msg_date = datetime.fromisoformat(ts.replace('Z', '+00:00')).date()
+                                    except Exception:
+                                        msg_date = mtime
+                                else:
+                                    msg_date = mtime
 
-            for model_id, usage in model_usage.items():
-                input_tokens = usage.get("inputTokens", 0)
-                output_tokens = usage.get("outputTokens", 0)
-                cache_read = usage.get("cacheReadInputTokens", 0)
-                cache_write = usage.get("cacheCreationInputTokens", 0)
+                                if msg_date < thirty_days_ago:
+                                    continue
 
-                pricing = PRICING.get(model_id, DEFAULT_PRICING)
-                cost = (
-                    (input_tokens / 1_000_000) * pricing["input"] +
-                    (output_tokens / 1_000_000) * pricing["output"] +
-                    (cache_read / 1_000_000) * pricing["cache_read"] +
-                    (cache_write / 1_000_000) * pricing["cache_write"]
-                )
-                total_cost += cost
+                                inp = usage.get("input_tokens", 0)
+                                out = usage.get("output_tokens", 0)
+                                model = msg.get("model", "")
+                                price = pricing.get_price(model) if model else None
+                                msg_cost = (inp * price["input"] + out * price["output"]) if price else 0.0
+                                is_today = (msg_date == today)
 
-            result["cost_30_days"] = total_cost
-            result["cost_today"] = (result["cost_today_tokens"] / 1_000_000) * 5  # Rough estimate
+                                result["cost_30_days_tokens"] += inp + out
+                                result["cost_30_days_input_tokens"] += inp
+                                result["cost_30_days_output_tokens"] += out
+                                result["cost_30_days"] += msg_cost
+                                if is_today:
+                                    result["cost_today_tokens"] += inp + out
+                                    result["cost_today_input_tokens"] += inp
+                                    result["cost_today_output_tokens"] += out
+                                    result["cost_today"] += msg_cost
 
+                                if model and (inp + out) > 0:
+                                    display = _format_model_name(model)
+                                    b = result["cost_by_model"].setdefault(display, {"input": 0, "output": 0, "cost": 0.0})
+                                    b["input"] += inp
+                                    b["output"] += out
+                                    b["cost"] += msg_cost
+                                    if is_today:
+                                        bt = result["cost_today_by_model"].setdefault(display, {"input": 0, "output": 0, "cost": 0.0})
+                                        bt["input"] += inp
+                                        bt["output"] += out
+                                        bt["cost"] += msg_cost
+                            except (json.JSONDecodeError, TypeError):
+                                continue
+                except OSError:
+                    continue
         except Exception:
             pass
 
@@ -287,8 +406,15 @@ class CodexCollector:
             "extra_usage_pct": 0,
             "cost_today": 0,
             "cost_today_tokens": 0,
+            "cost_today_input_tokens": 0,
+            "cost_today_output_tokens": 0,
+            "cost_today_by_model": {},
             "cost_30_days": 0,
             "cost_30_days_tokens": 0,
+            "cost_30_days_input_tokens": 0,
+            "cost_30_days_output_tokens": 0,
+            "cost_by_model": {},
+            "cost_approximate": False,
         }
 
         if not self.auth_file.exists():
@@ -390,16 +516,21 @@ class CodexCollector:
         Session files at ~/.codex/sessions/YYYY/MM/DD/*.jsonl contain
         token_count events with cumulative total_token_usage per session.
         We read the last token_count from each session to get its totals.
+        Prices are fetched live from OpenRouter (cached 24h).
         """
         if not self.sessions_dir.exists():
             return
 
+        model = self._get_codex_model()
+        pricing = PricingCache()
+        price = pricing.get_price(model) if model else None
+        approximate = pricing.is_approximate(model) if model else False
+        model_display = _format_model_name(model) if model else None
+        result["cost_approximate"] = approximate
+
         try:
             today = datetime.now().date()
             thirty_days_ago = today - timedelta(days=30)
-
-            today_tokens = 0
-            thirty_day_tokens = 0
 
             # Walk date-organized directories: sessions/YYYY/MM/DD/*.jsonl
             for year_dir in sorted(self.sessions_dir.iterdir()):
@@ -425,25 +556,58 @@ class CodexCollector:
                             continue
 
                         for session_file in day_dir.glob("*.jsonl"):
-                            session_tokens = self._get_session_tokens(session_file)
-                            if dir_date == today:
-                                today_tokens += session_tokens
-                            thirty_day_tokens += session_tokens
+                            inp, out = self._get_session_tokens(session_file)
+                            cost = (inp * price["input"] + out * price["output"]) if price else 0.0
 
-            result["cost_today_tokens"] = today_tokens
-            result["cost_30_days_tokens"] = thirty_day_tokens
+                            result["cost_30_days_tokens"] += inp + out
+                            result["cost_30_days_input_tokens"] += inp
+                            result["cost_30_days_output_tokens"] += out
+                            result["cost_30_days"] += cost
+                            if dir_date == today:
+                                result["cost_today_tokens"] += inp + out
+                                result["cost_today_input_tokens"] += inp
+                                result["cost_today_output_tokens"] += out
+                                result["cost_today"] += cost
+
+                            if model_display:
+                                b = result["cost_by_model"].setdefault(model_display, {"input": 0, "output": 0, "cost": 0.0})
+                                b["input"] += inp
+                                b["output"] += out
+                                b["cost"] += cost
+                                if dir_date == today:
+                                    bt = result["cost_today_by_model"].setdefault(model_display, {"input": 0, "output": 0, "cost": 0.0})
+                                    bt["input"] += inp
+                                    bt["output"] += out
+                                    bt["cost"] += cost
 
         except Exception:
             pass  # Silently fail for cost stats
 
-    def _get_session_tokens(self, session_file: Path) -> int:
-        """Extract non-cached tokens from the last token_count event in a session file.
+    def _get_codex_model(self) -> Optional[str]:
+        """Read the model name from ~/.codex/config.toml."""
+        config_file = CODEX_DIR / "config.toml"
+        if not config_file.exists():
+            return None
+        try:
+            with open(config_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith('model') and '=' in line:
+                        parts = line.split('=', 1)
+                        if len(parts) == 2:
+                            return parts[1].strip().strip('"\'')
+        except Exception:
+            pass
+        return None
 
-        Uses (input - cached_input + output) to measure actual new token processing,
-        excluding cache reads. This matches Claude's metric of
-        (input + cache_creation + output).
+    def _get_session_tokens(self, session_file: Path) -> tuple:
+        """Extract (input, output) tokens from the last token_count event in a session file.
+
+        Input = input_tokens - cached_input_tokens (non-cached input processed fresh).
+        Output = output_tokens.
         """
-        last_effective = 0
+        last_input = 0
+        last_output = 0
         try:
             with open(session_file, 'r') as f:
                 for line in f:
@@ -456,13 +620,13 @@ class CodexCollector:
                             usage = info.get("total_token_usage") or {}
                             input_tokens = usage.get("input_tokens", 0)
                             cached_tokens = usage.get("cached_input_tokens", 0)
-                            output_tokens = usage.get("output_tokens", 0)
-                            last_effective = (input_tokens - cached_tokens) + output_tokens
+                            last_input = input_tokens - cached_tokens
+                            last_output = usage.get("output_tokens", 0)
                     except (json.JSONDecodeError, KeyError, TypeError):
                         continue
         except Exception:
             pass
-        return last_effective
+        return last_input, last_output
 
 
 def main():

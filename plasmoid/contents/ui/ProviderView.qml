@@ -159,7 +159,7 @@ ColumnLayout {
             // Usage section
             ColumnLayout {
                 Layout.fillWidth: true
-                visible: providerData && providerData.is_connected && ((providerData.cost_today_tokens || 0) > 0 || (providerData.cost_30_days_tokens || 0) > 0 || (providerData.cost_30_days || 0) > 0)
+                visible: providerData && providerData.is_connected && ((providerData.cost_today_output_tokens || 0) > 0 || (providerData.cost_30_days_output_tokens || 0) > 0 || (providerData.cost_30_days || 0) > 0)
                 spacing: Kirigami.Units.smallSpacing
 
                 Kirigami.Separator { Layout.fillWidth: true }
@@ -169,28 +169,105 @@ ColumnLayout {
                     text: "Usage"
                 }
 
-                PlasmaComponents.Label {
-                    text: {
-                        if (!providerData) return ""
-                        var cost = providerData.cost_today || 0
-                        var tokens = providerData.cost_today_tokens || 0
-                        if (cost > 0)
-                            return "Today: $" + cost.toFixed(2) + " · " + formatTokens(tokens) + " tokens"
-                        return "Today: " + formatTokens(tokens) + " tokens"
+                // Today
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: 1
+                    visible: providerData && ((providerData.cost_today_input_tokens || 0) > 0 || (providerData.cost_today_output_tokens || 0) > 0)
+
+                    PlasmaComponents.Label {
+                        text: "Today"
+                        opacity: 0.5
                     }
-                    opacity: 0.8
+
+                    Repeater {
+                        model: providerData && providerData.cost_today_by_model ? Object.keys(providerData.cost_today_by_model) : []
+                        PlasmaComponents.Label {
+                            Layout.fillWidth: true
+                            required property string modelData
+                            leftPadding: Kirigami.Units.largeSpacing
+                            text: {
+                                var m = providerData.cost_today_by_model[modelData]
+                                if (!m) return ""
+                                var base = modelData + ":  " + formatTokens(m.input) + " in  /  " + formatTokens(m.output) + " out"
+                                return base + costSuffix(m.cost)
+                            }
+                            opacity: 0.8
+                        }
+                    }
+
+                    // Fallback when no per-model data
+                    PlasmaComponents.Label {
+                        Layout.fillWidth: true
+                        visible: !providerData || !providerData.cost_today_by_model || Object.keys(providerData.cost_today_by_model).length === 0
+                        leftPadding: Kirigami.Units.largeSpacing
+                        text: {
+                            if (!providerData) return ""
+                            var inp = providerData.cost_today_input_tokens || 0
+                            var out = providerData.cost_today_output_tokens || 0
+                            var base = formatTokens(inp) + " in  /  " + formatTokens(out) + " out"
+                            return base + costSuffix(providerData.cost_today || 0)
+                        }
+                        opacity: 0.8
+                    }
                 }
 
-                PlasmaComponents.Label {
-                    text: {
-                        if (!providerData) return ""
-                        var cost = providerData.cost_30_days || 0
-                        var tokens = providerData.cost_30_days_tokens || 0
-                        if (cost > 0)
-                            return "Last 30 days: $" + cost.toFixed(2) + " · " + formatTokens(tokens) + " tokens"
-                        return "Last 30 days: " + formatTokens(tokens) + " tokens"
+                // 30 days
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: 1
+
+                    PlasmaComponents.Label {
+                        text: "30 days"
+                        opacity: 0.5
                     }
-                    opacity: 0.8
+
+                    Repeater {
+                        model: providerData && providerData.cost_by_model ? Object.keys(providerData.cost_by_model) : []
+                        PlasmaComponents.Label {
+                            Layout.fillWidth: true
+                            required property string modelData
+                            leftPadding: Kirigami.Units.largeSpacing
+                            text: {
+                                var m = providerData.cost_by_model[modelData]
+                                if (!m) return ""
+                                var base = modelData + ":  " + formatTokens(m.input) + " in  /  " + formatTokens(m.output) + " out"
+                                return base + costSuffix(m.cost)
+                            }
+                            opacity: 0.8
+                        }
+                    }
+
+                    // Total line when multiple models
+                    PlasmaComponents.Label {
+                        Layout.fillWidth: true
+                        visible: providerData && providerData.cost_by_model && Object.keys(providerData.cost_by_model).length > 1
+                        leftPadding: Kirigami.Units.largeSpacing
+                        font.italic: true
+                        text: {
+                            if (!providerData) return ""
+                            var inp = providerData.cost_30_days_input_tokens || 0
+                            var out = providerData.cost_30_days_output_tokens || 0
+                            var base = "Total:  " + formatTokens(inp) + " in  /  " + formatTokens(out) + " out"
+                            return base + costSuffix(providerData.cost_30_days || 0)
+                        }
+                        opacity: 0.6
+                    }
+
+                    // Fallback when no per-model data
+                    PlasmaComponents.Label {
+                        Layout.fillWidth: true
+                        visible: !providerData || !providerData.cost_by_model || Object.keys(providerData.cost_by_model).length === 0
+                        leftPadding: Kirigami.Units.largeSpacing
+                        text: {
+                            if (!providerData) return ""
+                            var inp = providerData.cost_30_days_input_tokens || 0
+                            var out = providerData.cost_30_days_output_tokens || 0
+                            var base = formatTokens(inp) + " in  /  " + formatTokens(out) + " out"
+                            return base + costSuffix(providerData.cost_30_days || 0)
+                        }
+                        opacity: 0.8
+                    }
                 }
             }
 
@@ -216,6 +293,12 @@ ColumnLayout {
                 }
             }
         }
+    }
+
+    function costSuffix(cost) {
+        if (!cost || cost <= 0) return ""
+        var prefix = providerData && providerData.cost_approximate ? "~$" : "$"
+        return "  ·  " + prefix + cost.toFixed(2)
     }
 
     function formatResetTime(isoTime) {

@@ -202,7 +202,6 @@ class ClaudeOAuthFetcher:
                                         continue
                                     session_tokens += (
                                         usage.get("input_tokens", 0)
-                                        + usage.get("cache_creation_input_tokens", 0)
                                         + usage.get("output_tokens", 0)
                                     )
                                 except (json.JSONDecodeError, TypeError):
