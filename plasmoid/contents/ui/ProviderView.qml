@@ -19,11 +19,18 @@ ColumnLayout {
 
     spacing: Kirigami.Units.largeSpacing
 
+    function hasLocalUsageData() {
+        if (!providerData) return false
+        return ((providerData.cost_today_output_tokens || 0) > 0)
+            || ((providerData.cost_30_days_output_tokens || 0) > 0)
+            || ((providerData.cost_30_days || 0) > 0)
+    }
+
     // Not connected state
     ColumnLayout {
         Layout.fillWidth: true
         Layout.fillHeight: true
-        visible: !providerData || !providerData.is_connected
+        visible: !providerData || (!providerData.is_connected && !root.hasLocalUsageData())
         spacing: Kirigami.Units.largeSpacing
 
         Item { Layout.fillHeight: true }
@@ -51,7 +58,7 @@ ColumnLayout {
     PlasmaComponents.ScrollView {
         Layout.fillWidth: true
         Layout.fillHeight: true
-        visible: providerData && providerData.is_connected
+        visible: providerData && (providerData.is_connected || root.hasLocalUsageData())
 
         contentWidth: availableWidth
 
@@ -59,9 +66,19 @@ ColumnLayout {
             width: parent.width
             spacing: Kirigami.Units.largeSpacing
 
+            PlasmaComponents.Label {
+                Layout.fillWidth: true
+                visible: providerData && providerData.error_message
+                text: providerData ? providerData.error_message : ""
+                wrapMode: Text.WordWrap
+                color: Kirigami.Theme.negativeTextColor
+                opacity: 0.8
+            }
+
             // Plan badge
             RowLayout {
                 Layout.fillWidth: true
+                visible: providerData && providerData.plan_name
 
                 PlasmaComponents.Label {
                     text: "Plan:"
@@ -79,6 +96,7 @@ ColumnLayout {
             // Session usage
             UsageBar {
                 Layout.fillWidth: true
+                visible: providerData && providerData.is_connected
                 title: "Session"
                 percentage: providerData ? providerData.session_used_pct : 0
                 subtitle: formatResetTime(providerData ? providerData.session_reset_time : "")
@@ -87,6 +105,7 @@ ColumnLayout {
             // Weekly usage
             UsageBar {
                 Layout.fillWidth: true
+                visible: providerData && providerData.is_connected
                 title: "Weekly"
                 percentage: providerData ? providerData.weekly_used_pct : 0
                 subtitle: formatResetTime(providerData ? providerData.weekly_reset_time : "")
@@ -96,7 +115,7 @@ ColumnLayout {
             // Models section
             ColumnLayout {
                 Layout.fillWidth: true
-                visible: providerData && providerData.model_usage && Object.keys(providerData.model_usage).length > 0
+                visible: providerData && providerData.is_connected && providerData.model_usage && Object.keys(providerData.model_usage).length > 0
                 spacing: Kirigami.Units.smallSpacing
 
                 Kirigami.Separator { Layout.fillWidth: true }
@@ -122,7 +141,7 @@ ColumnLayout {
             // Extra usage section
             ColumnLayout {
                 Layout.fillWidth: true
-                visible: providerData && providerData.extra_usage_enabled
+                visible: providerData && providerData.is_connected && providerData.extra_usage_enabled
                 spacing: Kirigami.Units.smallSpacing
 
                 Kirigami.Separator { Layout.fillWidth: true }
@@ -159,7 +178,7 @@ ColumnLayout {
             // Usage section
             ColumnLayout {
                 Layout.fillWidth: true
-                visible: providerData && providerData.is_connected && ((providerData.cost_today_output_tokens || 0) > 0 || (providerData.cost_30_days_output_tokens || 0) > 0 || (providerData.cost_30_days || 0) > 0)
+                visible: providerData && root.hasLocalUsageData()
                 spacing: Kirigami.Units.smallSpacing
 
                 Kirigami.Separator { Layout.fillWidth: true }

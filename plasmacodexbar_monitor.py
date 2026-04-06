@@ -52,8 +52,10 @@ CODEX_DIR = Path.home() / ".codex"
 ICON_DIR = Path(tempfile.gettempdir()) / "ai-usage-monitor-icons"
 
 # Claude OAuth API
+CLAUDE_MESSAGES_API_URL = "https://api.anthropic.com/v1/messages"
 CLAUDE_OAUTH_API_URL = "https://api.anthropic.com/api/oauth/usage"
 CLAUDE_OAUTH_BETA_HEADER = "oauth-2025-04-20"
+CLAUDE_QUOTA_CHECK_MODEL = "claude-sonnet-4-6"
 
 # Codex OAuth API
 CODEX_OAUTH_API_URL = "https://chatgpt.com/backend-api/wham/usage"
@@ -110,7 +112,7 @@ class ProviderStats:
 @dataclass
 class AppConfig:
     """Application configuration"""
-    refresh_interval: int = 60
+    refresh_interval: int = 300
     enabled_providers: List[str] = field(default_factory=lambda: ["claude", "codex"])
 
 
@@ -124,6 +126,37 @@ class ClaudeOAuthFetcher:
     def __init__(self):
         self.credentials_file = CLAUDE_DIR / ".credentials.json"
         self.stats_file = CLAUDE_DIR / "stats-cache.json"
+        self.debug_log = CLAUDE_DIR / "debug" / "latest"
+
+    def _read_debug_tail(self, max_bytes: int = 65536) -> str:
+        """Read the tail of the latest Claude debug log for auth diagnostics."""
+        if not self.debug_log.exists():
+            return ""
+        try:
+            with open(self.debug_log, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - max_bytes))
+                return f.read().decode("utf-8", errors="ignore")
+        except Exception:
+            return ""
+
+    def _expired_token_message(self) -> str:
+        default = "Token expired. Run 'claude auth login' to re-authenticate."
+        try:
+            age = datetime.now() - datetime.fromtimestamp(self.debug_log.stat().st_mtime)
+            if age > timedelta(days=2):
+                return default
+        except Exception:
+            return default
+
+        debug_tail = self._read_debug_tail()
+        if (
+            "https://platform.claude.com/v1/oauth/token,status=400" in debug_tail
+            and "OAuth token has expired. Please obtain a new token or refresh your existing token." in debug_tail
+        ):
+            return "Token expired. Claude refresh failed; run 'claude auth logout' then 'claude auth login'."
+        return default
 
     def _load_credentials(self) -> Optional[dict]:
         """Load OAuth credentials from Claude Code"""
@@ -137,7 +170,7 @@ class ClaudeOAuthFetcher:
             return None
 
     def _fetch_usage_api(self, access_token: str) -> Optional[dict]:
-        """Fetch usage data from Claude OAuth API"""
+        """Fetch usage data from Claude OAuth API."""
         try:
             req = urllib.request.Request(
                 CLAUDE_OAUTH_API_URL,
@@ -157,6 +190,83 @@ class ClaudeOAuthFetcher:
         except Exception as e:
             print(f"Claude API error: {e}")
         return None
+
+    @staticmethod
+    def _epoch_to_datetime(epoch_str: Optional[str]) -> Optional[datetime]:
+        if not epoch_str:
+            return None
+        try:
+            return datetime.fromtimestamp(int(epoch_str), tz=timezone.utc)
+        except (ValueError, OSError):
+            return None
+
+    def _fetch_usage_from_headers(self, access_token: str) -> Optional[dict]:
+        """Use Claude's OAuth-enabled inference path and read quota headers."""
+        payload = json.dumps({
+            "model": CLAUDE_QUOTA_CHECK_MODEL,
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "quota"}],
+        }).encode("utf-8")
+
+        req = urllib.request.Request(
+            CLAUDE_MESSAGES_API_URL,
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "anthropic-version": "2023-06-01",
+                "anthropic-beta": CLAUDE_OAUTH_BETA_HEADER,
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=30) as response:
+                if response.status != 200:
+                    return None
+                headers = response.headers
+        except urllib.error.HTTPError as e:
+            if e.code in (400, 401, 403, 404):
+                return None
+            print(f"Claude header fetch HTTP error: {e.code}")
+            return None
+        except Exception as e:
+            print(f"Claude header fetch error: {e}")
+            return None
+
+        five_hour_util = headers.get("anthropic-ratelimit-unified-5h-utilization")
+        seven_day_util = headers.get("anthropic-ratelimit-unified-7d-utilization")
+        overage_util = headers.get("anthropic-ratelimit-unified-overage-utilization")
+        overage_status = headers.get("anthropic-ratelimit-unified-overage-status")
+
+        if (
+            five_hour_util is None
+            and seven_day_util is None
+            and overage_util is None
+            and overage_status is None
+        ):
+            return None
+
+        usage_data: Dict[str, Any] = {}
+        if five_hour_util is not None:
+            usage_data["five_hour"] = {
+                "utilization": float(five_hour_util) * 100,
+                "resets_at": self._epoch_to_datetime(headers.get("anthropic-ratelimit-unified-5h-reset")),
+            }
+        if seven_day_util is not None:
+            usage_data["seven_day"] = {
+                "utilization": float(seven_day_util) * 100,
+                "resets_at": self._epoch_to_datetime(headers.get("anthropic-ratelimit-unified-7d-reset")),
+            }
+        if overage_util is not None or overage_status is not None:
+            usage_data["extra_usage"] = {
+                "is_enabled": overage_status not in (None, "", "disabled"),
+                "utilization": float(overage_util or 0) * 100,
+                "used_credits": 0,
+                "monthly_limit": 0,
+            }
+        return usage_data
 
     def _load_local_cost_stats(self) -> dict:
         """Load cost/token stats from Claude session files and stats cache.
@@ -266,18 +376,18 @@ class ClaudeOAuthFetcher:
         # Load credentials
         creds = self._load_credentials()
         if not creds:
-            stats.error_message = "Not logged in. Run 'claude' to authenticate."
+            stats.error_message = "Not logged in. Run 'claude auth login' to authenticate."
             return stats
 
         access_token = creds.get("accessToken")
         if not access_token:
-            stats.error_message = "No access token found. Run 'claude' to authenticate."
+            stats.error_message = "No access token found. Run 'claude auth login' to authenticate."
             return stats
 
         # Check if token is expired
         expires_at = creds.get("expiresAt", 0)
         if expires_at and datetime.fromtimestamp(expires_at / 1000) < datetime.now():
-            stats.error_message = "Token expired. Run 'claude' to refresh."
+            stats.error_message = self._expired_token_message()
             return stats
 
         # Determine plan from credentials
@@ -292,8 +402,10 @@ class ClaudeOAuthFetcher:
         else:
             stats.plan_name = sub_type.title()
 
-        # Fetch from OAuth API
-        usage_data = self._fetch_usage_api(access_token)
+        # Fetch from OAuth-enabled inference headers first, then fall back.
+        usage_data = self._fetch_usage_from_headers(access_token)
+        if not usage_data:
+            usage_data = self._fetch_usage_api(access_token)
         if not usage_data:
             stats.error_message = "Failed to fetch usage data from API."
             stats.is_connected = True  # We have credentials, just API failed
@@ -309,7 +421,10 @@ class ClaudeOAuthFetcher:
             resets_at = five_hour.get("resets_at")
             if resets_at:
                 try:
-                    stats.session_reset_time = datetime.fromisoformat(resets_at.replace('Z', '+00:00'))
+                    if isinstance(resets_at, datetime):
+                        stats.session_reset_time = resets_at
+                    else:
+                        stats.session_reset_time = datetime.fromisoformat(resets_at.replace('Z', '+00:00'))
                 except:
                     pass
 
@@ -320,7 +435,10 @@ class ClaudeOAuthFetcher:
             resets_at = seven_day.get("resets_at")
             if resets_at:
                 try:
-                    stats.weekly_reset_time = datetime.fromisoformat(resets_at.replace('Z', '+00:00'))
+                    if isinstance(resets_at, datetime):
+                        stats.weekly_reset_time = resets_at
+                    else:
+                        stats.weekly_reset_time = datetime.fromisoformat(resets_at.replace('Z', '+00:00'))
                 except:
                     pass
 

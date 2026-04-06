@@ -18,6 +18,9 @@ PlasmoidItem {
     property string currentTab: "claude"
     property bool loading: true
     property string lastError: ""
+    property int defaultRefreshMs: 300000
+    property int rateLimitedRefreshMs: 1800000
+    property int refreshMs: defaultRefreshMs
 
     Plasmoid.icon: Qt.resolvedUrl("../icons/ai-robot.svg")
     toolTipMainText: "PlasmaCodexBar"
@@ -59,6 +62,10 @@ PlasmoidItem {
                             }
                         }
                     }
+                    var claudeRateLimited = root.claudeData
+                        && root.claudeData.error_message
+                        && root.claudeData.error_message.indexOf("Rate limited") !== -1
+                    root.refreshMs = claudeRateLimited ? root.rateLimitedRefreshMs : root.defaultRefreshMs
                     root.lastError = ""
                 } catch (e) {
                     root.lastError = "Parse error"
@@ -81,7 +88,7 @@ PlasmoidItem {
 
     // Auto refresh
     Timer {
-        interval: 60000
+        interval: root.refreshMs
         running: true
         repeat: true
         triggeredOnStart: true
