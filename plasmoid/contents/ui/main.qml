@@ -13,14 +13,36 @@ import org.kde.kirigami as Kirigami
 PlasmoidItem {
     id: root
 
-    property var claudeData: null
-    property var codexData: null
-    property string currentTab: "claude"
+    // All provider data keyed by provider_id
+    property var providerDataMap: ({})
+    property string currentTab: ""
     property bool loading: true
     property string lastError: ""
-    property int defaultRefreshMs: 300000
+    property int defaultRefreshMs: Plasmoid.configuration.refreshInterval * 1000 || 300000
     property int rateLimitedRefreshMs: 1800000
     property int refreshMs: defaultRefreshMs
+
+    // Provider registry: id -> { name, icon, dashboard, status }
+    readonly property var providerMeta: ({
+        "claude":     { name: "Claude",     icon: "../icons/claude-logo.svg",     dashboard: "https://claude.ai/settings/usage",         status: "https://status.anthropic.com/" },
+        "codex":      { name: "Codex",      icon: "../icons/openai-logo.svg",     dashboard: "https://platform.openai.com/usage",        status: "https://status.openai.com/" },
+        "gemini":     { name: "Gemini",     icon: "../icons/gemini-logo.svg",     dashboard: "https://aistudio.google.com/",             status: "https://status.cloud.google.com/" },
+        "copilot":    { name: "Copilot",    icon: "../icons/copilot-logo.svg",    dashboard: "https://github.com/settings/copilot",      status: "https://www.githubstatus.com/" },
+        "cursor":     { name: "Cursor",     icon: "../icons/cursor-logo.svg",     dashboard: "https://www.cursor.com/settings",          status: "https://status.cursor.com/" },
+        "openrouter": { name: "OpenRouter", icon: "../icons/openrouter-logo.svg", dashboard: "https://openrouter.ai/activity",           status: "https://status.openrouter.ai/" }
+    })
+
+    // Which providers to show (from config)
+    property var enabledList: {
+        var raw = Plasmoid.configuration.enabledProviders || "claude,codex"
+        var parts = raw.split(",")
+        var result = []
+        for (var i = 0; i < parts.length; i++) {
+            var id = parts[i].trim()
+            if (id.length > 0 && providerMeta[id]) result.push(id)
+        }
+        return result
+    }
 
     Plasmoid.icon: Qt.resolvedUrl("../icons/ai-robot.svg")
     toolTipMainText: "PlasmaCodexBar"
@@ -29,11 +51,13 @@ PlasmoidItem {
     function getTooltipText() {
         if (loading) return "Loading..."
         var parts = []
-        if (claudeData && claudeData.is_connected) {
-            parts.push("Claude: " + Math.round(claudeData.session_used_pct) + "%")
-        }
-        if (codexData && codexData.is_connected) {
-            parts.push("Codex: " + Math.round(codexData.session_used_pct) + "%")
+        for (var i = 0; i < enabledList.length; i++) {
+            var id = enabledList[i]
+            var d = providerDataMap[id]
+            if (d && d.is_connected) {
+                var meta = providerMeta[id]
+                parts.push(meta.name + ": " + Math.round(d.session_used_pct) + "%")
+            }
         }
         return parts.length > 0 ? parts.join(" | ") : "Click to configure"
     }
@@ -53,19 +77,31 @@ PlasmoidItem {
                 try {
                     var result = JSON.parse(stdout)
                     if (result.providers) {
+                        var newMap = {}
+                        // Preserve existing data first
+                        var keys = Object.keys(root.providerDataMap)
+                        for (var k = 0; k < keys.length; k++) {
+                            newMap[keys[k]] = root.providerDataMap[keys[k]]
+                        }
+                        // Update with new data
                         for (var i = 0; i < result.providers.length; i++) {
                             var p = result.providers[i]
-                            if (p.provider_id === "claude") {
-                                root.claudeData = p
-                            } else if (p.provider_id === "codex") {
-                                root.codexData = p
-                            }
+                            newMap[p.provider_id] = p
+                        }
+                        root.providerDataMap = newMap
+                    }
+
+                    // Check if any provider is rate limited
+                    var anyRateLimited = false
+                    var eKeys = Object.keys(root.providerDataMap)
+                    for (var j = 0; j < eKeys.length; j++) {
+                        var pd = root.providerDataMap[eKeys[j]]
+                        if (pd && pd.error_message && pd.error_message.indexOf("Rate limited") !== -1) {
+                            anyRateLimited = true
+                            break
                         }
                     }
-                    var claudeRateLimited = root.claudeData
-                        && root.claudeData.error_message
-                        && root.claudeData.error_message.indexOf("Rate limited") !== -1
-                    root.refreshMs = claudeRateLimited ? root.rateLimitedRefreshMs : root.defaultRefreshMs
+                    root.refreshMs = anyRateLimited ? root.rateLimitedRefreshMs : root.defaultRefreshMs
                     root.lastError = ""
                 } catch (e) {
                     root.lastError = "Parse error"
@@ -74,6 +110,12 @@ PlasmoidItem {
                 root.lastError = stderr || "Backend error"
             }
             root.loading = false
+
+            // Set initial tab if not set
+            if (root.currentTab === "" && root.enabledList.length > 0) {
+                root.currentTab = root.enabledList[0]
+            }
+
             disconnectSource(source)
         }
     }
@@ -142,71 +184,53 @@ PlasmoidItem {
             anchors.margins: Kirigami.Units.smallSpacing
             spacing: Kirigami.Units.largeSpacing
 
-            // Compact tab buttons with icon above text
+            // Dynamic tab bar
             RowLayout {
                 Layout.alignment: Qt.AlignHCenter
                 spacing: Kirigami.Units.smallSpacing
 
-                // Codex tab
-                Rectangle {
-                    width: 60
-                    height: 50
-                    radius: 6
-                    color: root.currentTab === "codex" ? Kirigami.Theme.highlightColor : "transparent"
+                Repeater {
+                    model: root.enabledList
 
-                    MouseArea {
-                        anchors.fill: parent
-                        onClicked: root.currentTab = "codex"
-                    }
+                    Rectangle {
+                        required property string modelData
 
-                    ColumnLayout {
-                        anchors.centerIn: parent
-                        spacing: 2
+                        width: 60
+                        height: 50
+                        radius: 6
+                        color: root.currentTab === modelData ? Kirigami.Theme.highlightColor : "transparent"
 
-                        Kirigami.Icon {
-                            source: Qt.resolvedUrl("../icons/openai-logo.svg")
-                            implicitWidth: 20
-                            implicitHeight: 20
-                            Layout.alignment: Qt.AlignHCenter
+                        MouseArea {
+                            anchors.fill: parent
+                            onClicked: root.currentTab = modelData
                         }
 
-                        PlasmaComponents.Label {
-                            text: "Codex"
-                            font.pointSize: Kirigami.Theme.smallFont.pointSize
-                            Layout.alignment: Qt.AlignHCenter
-                            color: root.currentTab === "codex" ? Kirigami.Theme.highlightedTextColor : Kirigami.Theme.textColor
-                        }
-                    }
-                }
+                        ColumnLayout {
+                            anchors.centerIn: parent
+                            spacing: 2
 
-                // Claude tab
-                Rectangle {
-                    width: 60
-                    height: 50
-                    radius: 6
-                    color: root.currentTab === "claude" ? Kirigami.Theme.highlightColor : "transparent"
+                            Kirigami.Icon {
+                                source: {
+                                    var meta = root.providerMeta[modelData]
+                                    return meta ? Qt.resolvedUrl(meta.icon) : ""
+                                }
+                                implicitWidth: 20
+                                implicitHeight: 20
+                                Layout.alignment: Qt.AlignHCenter
+                                isMask: true
+                                // Fallback to generic icon if provider icon missing
+                                fallback: "application-x-executable"
+                            }
 
-                    MouseArea {
-                        anchors.fill: parent
-                        onClicked: root.currentTab = "claude"
-                    }
-
-                    ColumnLayout {
-                        anchors.centerIn: parent
-                        spacing: 2
-
-                        Kirigami.Icon {
-                            source: Qt.resolvedUrl("../icons/claude-logo.svg")
-                            implicitWidth: 20
-                            implicitHeight: 20
-                            Layout.alignment: Qt.AlignHCenter
-                        }
-
-                        PlasmaComponents.Label {
-                            text: "Claude"
-                            font.pointSize: Kirigami.Theme.smallFont.pointSize
-                            Layout.alignment: Qt.AlignHCenter
-                            color: root.currentTab === "claude" ? Kirigami.Theme.highlightedTextColor : Kirigami.Theme.textColor
+                            PlasmaComponents.Label {
+                                text: {
+                                    var meta = root.providerMeta[modelData]
+                                    return meta ? meta.name : modelData
+                                }
+                                font.pointSize: Kirigami.Theme.smallFont.pointSize
+                                Layout.alignment: Qt.AlignHCenter
+                                color: root.currentTab === modelData ? Kirigami.Theme.highlightedTextColor : Kirigami.Theme.textColor
+                            }
                         }
                     }
                 }
@@ -228,18 +252,40 @@ PlasmoidItem {
                 horizontalAlignment: Text.AlignHCenter
             }
 
+            // No providers configured hint
+            PlasmaComponents.Label {
+                text: "No providers enabled.\nRight-click the widget and select 'Configure...' to choose providers."
+                visible: root.enabledList.length === 0 && !root.loading
+                Layout.fillWidth: true
+                horizontalAlignment: Text.AlignHCenter
+                wrapMode: Text.WordWrap
+                opacity: 0.7
+            }
+
             // Provider content
             ProviderView {
                 id: providerView
                 Layout.fillWidth: true
                 Layout.fillHeight: true
-                visible: !root.loading
+                visible: !root.loading && root.enabledList.length > 0
 
-                providerData: root.currentTab === "claude" ? root.claudeData : root.codexData
-                providerName: root.currentTab === "claude" ? "Claude" : "Codex"
-                providerIcon: root.currentTab === "claude" ? Qt.resolvedUrl("../icons/claude-logo.svg") : Qt.resolvedUrl("../icons/openai-logo.svg")
-                dashboardUrl: root.currentTab === "claude" ? "https://claude.ai/settings/usage" : "https://platform.openai.com/usage"
-                statusUrl: root.currentTab === "claude" ? "https://status.anthropic.com/" : "https://status.openai.com/"
+                providerData: root.providerDataMap[root.currentTab] || null
+                providerName: {
+                    var meta = root.providerMeta[root.currentTab]
+                    return meta ? meta.name : ""
+                }
+                providerIcon: {
+                    var meta = root.providerMeta[root.currentTab]
+                    return meta ? Qt.resolvedUrl(meta.icon) : ""
+                }
+                dashboardUrl: {
+                    var meta = root.providerMeta[root.currentTab]
+                    return meta ? meta.dashboard : ""
+                }
+                statusUrl: {
+                    var meta = root.providerMeta[root.currentTab]
+                    return meta ? meta.status : ""
+                }
             }
         }
     }

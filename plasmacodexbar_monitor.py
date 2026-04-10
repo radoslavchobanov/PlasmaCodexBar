@@ -113,7 +113,9 @@ class ProviderStats:
 class AppConfig:
     """Application configuration"""
     refresh_interval: int = 300
-    enabled_providers: List[str] = field(default_factory=lambda: ["claude", "codex"])
+    enabled_providers: List[str] = field(default_factory=lambda: [
+        "claude", "codex", "gemini", "copilot", "cursor", "openrouter"
+    ])
 
 
 # ============================================================================
@@ -1916,6 +1918,93 @@ class AIUsageMonitorWindow(Gtk.Window):
 
 
 # ============================================================================
+# Adapter Bridge – wraps backend adapters to return ProviderStats
+# ============================================================================
+
+def _dict_to_provider_stats(d: Dict[str, Any]) -> ProviderStats:
+    """Convert a backend adapter dict result to a ProviderStats dataclass."""
+    reset_session = None
+    if d.get("session_reset_time"):
+        try:
+            reset_session = datetime.fromisoformat(
+                str(d["session_reset_time"]).replace("Z", "+00:00")
+            )
+        except Exception:
+            pass
+
+    reset_weekly = None
+    if d.get("weekly_reset_time"):
+        try:
+            reset_weekly = datetime.fromisoformat(
+                str(d["weekly_reset_time"]).replace("Z", "+00:00")
+            )
+        except Exception:
+            pass
+
+    return ProviderStats(
+        provider_id=d.get("provider_id", ""),
+        provider_name=d.get("provider_name", ""),
+        is_connected=d.get("is_connected", False),
+        last_update=datetime.now(timezone.utc),
+        error_message=d.get("error_message", ""),
+        plan_name=d.get("plan_name", "Unknown"),
+        session_used_pct=d.get("session_used_pct", 0.0),
+        session_reset_time=reset_session,
+        weekly_used_pct=d.get("weekly_used_pct", 0.0),
+        weekly_reset_time=reset_weekly,
+        pace_status=d.get("pace_status", "On track"),
+        model_usage=d.get("model_usage", {}),
+        extra_usage_enabled=d.get("extra_usage_enabled", False),
+        extra_usage_current=d.get("extra_usage_current", 0.0),
+        extra_usage_limit=d.get("extra_usage_limit", 0.0),
+        extra_usage_pct=d.get("extra_usage_pct", 0.0),
+        cost_today=d.get("cost_today", 0.0),
+        cost_today_tokens=d.get("cost_today_tokens", 0),
+        cost_30_days=d.get("cost_30_days", 0.0),
+        cost_30_days_tokens=d.get("cost_30_days_tokens", 0),
+    )
+
+
+class _AdapterBridge:
+    """Wraps a backend adapter (dict-based) as a monitor-compatible collector."""
+
+    def __init__(self, adapter):
+        self._adapter = adapter
+
+    def collect(self) -> ProviderStats:
+        d = self._adapter.collect()
+        return _dict_to_provider_stats(d)
+
+
+def _load_adapter_collectors() -> Dict[str, Any]:
+    """Import adapters from the adapters package and wrap them for the monitor."""
+    adapters_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "plasmoid", "contents", "code", "adapters")
+    if not os.path.isdir(adapters_dir):
+        # Try relative to script location
+        adapters_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "adapters")
+    if adapters_dir not in sys.path:
+        sys.path.insert(0, adapters_dir)
+
+    result = {}
+    specs = [
+        ("gemini_adapter", "GeminiCollector", "gemini"),
+        ("copilot_adapter", "CopilotCollector", "copilot"),
+        ("cursor_adapter", "CursorCollector", "cursor"),
+        ("openrouter_adapter", "OpenRouterCollector", "openrouter"),
+    ]
+    for module_name, class_name, provider_id in specs:
+        try:
+            mod = __import__(module_name)
+            cls = getattr(mod, class_name)
+            result[provider_id] = _AdapterBridge(cls())
+        except Exception:
+            pass
+    return result
+
+
+# ============================================================================
 # Main Application
 # ============================================================================
 
@@ -1927,6 +2016,7 @@ class AIUsageMonitorApp:
             "claude": ClaudeOAuthFetcher(),
             "codex": CodexOAuthFetcher(),
         }
+        self.collectors.update(_load_adapter_collectors())
         self.providers: Dict[str, ProviderStats] = {}
         self.indicator = None
         self.window = None
@@ -2070,6 +2160,7 @@ def print_cli_status():
         "claude": ClaudeOAuthFetcher(),
         "codex": CodexOAuthFetcher(),
     }
+    collectors.update(_load_adapter_collectors())
 
     GREEN = "\033[92m"
     YELLOW = "\033[93m"

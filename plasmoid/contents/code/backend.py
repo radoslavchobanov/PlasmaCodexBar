@@ -15,6 +15,9 @@ from typing import Optional, Dict, Any
 import urllib.request
 import urllib.error
 
+# Add adapters directory to path for imports
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "adapters"))
+
 # Configuration paths
 CONFIG_DIR = Path.home() / ".config" / "plasmacodexbar"
 CLAUDE_DIR = Path.home() / ".claude"
@@ -792,9 +795,32 @@ class CodexCollector:
         return last_input, last_output
 
 
+def _load_optional_collectors():
+    """Import and instantiate collectors from the adapters package.
+
+    Each adapter is optional – if its file is missing or fails to import
+    the provider is simply skipped.
+    """
+    extra = []
+    adapter_specs = [
+        ("gemini_adapter", "GeminiCollector"),
+        ("copilot_adapter", "CopilotCollector"),
+        ("cursor_adapter", "CursorCollector"),
+        ("openrouter_adapter", "OpenRouterCollector"),
+    ]
+    for module_name, class_name in adapter_specs:
+        try:
+            mod = __import__(module_name)
+            cls = getattr(mod, class_name)
+            extra.append(cls())
+        except Exception:
+            pass
+    return extra
+
+
 def main():
     """Output usage data as JSON"""
-    collectors = [ClaudeCollector(), CodexCollector()]
+    collectors = [ClaudeCollector(), CodexCollector()] + _load_optional_collectors()
 
     providers = []
     for collector in collectors:
