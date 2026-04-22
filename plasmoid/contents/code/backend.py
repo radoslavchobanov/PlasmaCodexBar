@@ -832,6 +832,18 @@ class CodexCollector:
             "cost_30_days_output_tokens": 0,
             "cost_by_model": {},
             "cost_approximate": False,
+            # Stats tab fields
+            "stats_daily_activity": {},
+            "stats_tokens_by_model_by_day": {},
+            "stats_session_count": 0,
+            "stats_active_days": 0,
+            "stats_total_days_tracked": 0,
+            "stats_total_tokens": 0,
+            "stats_longest_session_seconds": 0,
+            "stats_most_active_day": "",
+            "stats_longest_streak_days": 0,
+            "stats_current_streak_days": 0,
+            "stats_favorite_model": "",
         }
 
         if not self.auth_file.exists():
@@ -925,6 +937,7 @@ class CodexCollector:
 
         # Load token stats from local session files
         self._load_cost_stats(result)
+        self._load_stats(result)
         return result
 
     def _load_cost_stats(self, result: Dict[str, Any]):
@@ -999,6 +1012,140 @@ class CodexCollector:
 
         except Exception:
             pass  # Silently fail for cost stats
+
+    def _load_stats(self, result: Dict[str, Any]):
+        """Compute all-time stats from all Codex session files.
+
+        Scans ~/.codex/sessions/YYYY/MM/DD/*.jsonl. One file = one session.
+        Token totals come from the last token_count event in each file
+        (cumulative total_token_usage). Session duration from first/last timestamp.
+        """
+        if not self.sessions_dir.exists():
+            return
+
+        model = self._get_codex_model()
+        model_display = _format_model_name(model) if model else None
+
+        daily_activity: Dict[str, int] = {}
+        tokens_by_model_by_day: Dict[str, Any] = {}
+        session_count = 0
+        sessions_with_duration = []  # seconds
+
+        try:
+            for year_dir in sorted(self.sessions_dir.iterdir()):
+                if not year_dir.is_dir() or not year_dir.name.isdigit():
+                    continue
+                for month_dir in sorted(year_dir.iterdir()):
+                    if not month_dir.is_dir() or not month_dir.name.isdigit():
+                        continue
+                    for day_dir in sorted(month_dir.iterdir()):
+                        if not day_dir.is_dir() or not day_dir.name.isdigit():
+                            continue
+
+                        try:
+                            dir_date = datetime(
+                                int(year_dir.name),
+                                int(month_dir.name),
+                                int(day_dir.name)
+                            ).date()
+                        except ValueError:
+                            continue
+
+                        date_key = dir_date.isoformat()
+
+                        for session_file in day_dir.glob("*.jsonl"):
+                            session_count += 1
+                            try:
+                                first_ts = None
+                                last_ts = None
+                                last_input = 0
+                                last_output = 0
+
+                                with open(session_file, 'r') as f:
+                                    for line in f:
+                                        try:
+                                            entry = json.loads(line)
+                                            ts = entry.get("timestamp")
+                                            if ts:
+                                                if first_ts is None:
+                                                    first_ts = ts
+                                                last_ts = ts
+                                            payload = entry.get("payload") or {}
+                                            if (entry.get("type") == "event_msg"
+                                                    and payload.get("type") == "token_count"):
+                                                info = payload.get("info") or {}
+                                                usage = info.get("total_token_usage") or {}
+                                                last_input = usage.get("input_tokens", 0)
+                                                last_output = usage.get("output_tokens", 0)
+                                        except (json.JSONDecodeError, TypeError):
+                                            continue
+
+                                total = last_input + last_output
+                                if total > 0:
+                                    daily_activity[date_key] = daily_activity.get(date_key, 0) + total
+                                    if model_display:
+                                        day_m = tokens_by_model_by_day.setdefault(date_key, {})
+                                        m_entry = day_m.setdefault(model_display, {"input": 0, "output": 0, "total": 0})
+                                        m_entry["input"] += last_input
+                                        m_entry["output"] += last_output
+                                        m_entry["total"] += total
+
+                                if first_ts and last_ts and first_ts != last_ts:
+                                    try:
+                                        t1 = datetime.fromisoformat(first_ts.replace('Z', '+00:00'))
+                                        t2 = datetime.fromisoformat(last_ts.replace('Z', '+00:00'))
+                                        sessions_with_duration.append((t2 - t1).total_seconds())
+                                    except Exception:
+                                        pass
+
+                            except OSError:
+                                continue
+
+        except Exception:
+            pass
+
+        result["stats_daily_activity"] = daily_activity
+        result["stats_tokens_by_model_by_day"] = tokens_by_model_by_day
+        result["stats_session_count"] = session_count
+        result["stats_total_tokens"] = sum(daily_activity.values())
+        result["stats_favorite_model"] = model_display or "—"
+
+        if sessions_with_duration:
+            result["stats_longest_session_seconds"] = max(sessions_with_duration)
+
+        if daily_activity:
+            result["stats_active_days"] = len(daily_activity)
+            result["stats_most_active_day"] = max(daily_activity, key=lambda d: daily_activity[d])
+
+            all_dates = sorted(datetime.fromisoformat(d).date() for d in daily_activity.keys())
+            result["stats_total_days_tracked"] = (all_dates[-1] - all_dates[0]).days + 1
+
+            date_set = set(all_dates)
+            today = datetime.now().date()
+
+            # Longest streak
+            longest = 1
+            run = 1
+            for i in range(1, len(all_dates)):
+                if (all_dates[i] - all_dates[i - 1]).days == 1:
+                    run += 1
+                    longest = max(longest, run)
+                else:
+                    run = 1
+            result["stats_longest_streak_days"] = longest
+
+            # Current streak (count back from today; also accept yesterday if today has no data yet)
+            current = 0
+            check = today
+            while check in date_set:
+                current += 1
+                check -= timedelta(days=1)
+            if current == 0:
+                check = today - timedelta(days=1)
+                while check in date_set:
+                    current += 1
+                    check -= timedelta(days=1)
+            result["stats_current_streak_days"] = current
 
     def _get_codex_model(self) -> Optional[str]:
         """Read the model name from ~/.codex/config.toml."""

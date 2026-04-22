@@ -239,10 +239,10 @@ PlasmoidItem {
                 }
             }
 
-            // Usage / Stats toggle pills (Claude only)
+            // Usage / Stats toggle pills (Claude + Codex)
             RowLayout {
                 Layout.alignment: Qt.AlignHCenter
-                visible: root.currentTab === "claude" && !root.loading && root.enabledList.length > 0
+                visible: (root.currentTab === "claude" || root.currentTab === "codex") && !root.loading && root.enabledList.length > 0
                 spacing: 4
 
                 Repeater {
@@ -302,7 +302,7 @@ PlasmoidItem {
                 id: providerView
                 Layout.fillWidth: true
                 Layout.fillHeight: true
-                visible: !root.loading && root.enabledList.length > 0 && (root.viewMode === "usage" || root.currentTab !== "claude")
+                visible: !root.loading && root.enabledList.length > 0 && (root.viewMode === "usage" || (root.currentTab !== "claude" && root.currentTab !== "codex"))
 
                 providerData: root.providerDataMap[root.currentTab] || null
                 providerName: {
@@ -323,12 +323,13 @@ PlasmoidItem {
                 }
             }
 
-            // Stats view (Claude only)
+            // Stats view (Claude + Codex)
             StatsView {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
-                visible: !root.loading && root.enabledList.length > 0 && root.viewMode === "stats" && root.currentTab === "claude"
+                visible: !root.loading && root.enabledList.length > 0 && root.viewMode === "stats" && (root.currentTab === "claude" || root.currentTab === "codex")
                 providerData: root.providerDataMap[root.currentTab] || null
+                accentColor: root.currentTab === "codex" ? "#74AA9C" : "#E8965A"
             }
         }
     }
