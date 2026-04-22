@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "ada
 CONFIG_DIR = Path.home() / ".config" / "plasmacodexbar"
 CLAUDE_DIR = Path.home() / ".claude"
 CODEX_DIR = Path.home() / ".codex"
+STATS_CACHE_FILE = CONFIG_DIR / "claude_stats_cache.json"
 
 # API endpoints
 CLAUDE_MESSAGES_API_URL = "https://api.anthropic.com/v1/messages"
@@ -389,6 +390,20 @@ class ClaudeCollector:
             "cost_30_days_output_tokens": 0,
             "cost_by_model": {},
             "cost_approximate": False,
+            # All-time stats
+            "stats_daily_activity": {},
+            "stats_total_tokens": 0,
+            "stats_total_input_tokens": 0,
+            "stats_total_output_tokens": 0,
+            "stats_active_days": 0,
+            "stats_total_days_tracked": 0,
+            "stats_most_active_day": "",
+            "stats_favorite_model": "",
+            "stats_session_count": 0,
+            "stats_longest_session_seconds": 0,
+            "stats_longest_streak_days": 0,
+            "stats_current_streak_days": 0,
+            "stats_tokens_by_model_by_day": {},
         }
 
         # Load credentials
@@ -456,13 +471,63 @@ class ClaudeCollector:
             self._save_cached_result(result)
         return result
 
+    def _load_stats_cache(self) -> Optional[Dict[str, Any]]:
+        """Load the all-time stats snapshot from disk.
+
+        Returns the cache dict when it exists and can be parsed, otherwise None.
+        The caller is responsible for deciding whether the cache is still valid.
+        """
+        if not STATS_CACHE_FILE.exists():
+            return None
+        try:
+            with open(STATS_CACHE_FILE, "r") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return None
+            return data
+        except Exception:
+            return None
+
+    def _save_stats_cache(
+        self,
+        daily_activity: Dict[str, int],
+        tokens_by_model_by_day: Dict[str, Any],
+        sessions: list,
+        total_input: int,
+        total_output: int,
+    ):
+        """Persist the all-time stats snapshot to disk."""
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "cached_at": datetime.now().date().isoformat(),
+                "daily_activity": daily_activity,
+                "tokens_by_model_by_day": tokens_by_model_by_day,
+                "sessions": sessions,
+                "total_input": total_input,
+                "total_output": total_output,
+            }
+            with open(STATS_CACHE_FILE, "w") as f:
+                json.dump(payload, f)
+        except Exception:
+            pass
+
     def _load_cost_stats(self, result: Dict[str, Any]):
         """Load cost/token stats from Claude session files.
 
         Token counts and costs come from parsing session JSONL files.
         Prices are fetched live from OpenRouter (cached 24h).
+
+        All-time stats (daily activity, streaks, sessions, favorite model)
+        are computed alongside the 30-day cost window.
+
+        Performance: An incremental cache (STATS_CACHE_FILE) stores the
+        all-time aggregates for data outside the 30-day rolling window.
+        The cache is rebuilt once per day; on subsequent refreshes that day
+        only the recent 30-day files are re-parsed.
         """
         today = datetime.now().date()
+        today_iso = today.isoformat()
         thirty_days_ago = today - timedelta(days=30)
         pricing = PricingCache()
 
@@ -470,21 +535,59 @@ class ClaudeCollector:
         if not projects_dir.exists():
             return
 
+        # ------------------------------------------------------------------
+        # Cache decision
+        # ------------------------------------------------------------------
+        existing_cache = self._load_stats_cache()
+        cache_valid = (
+            existing_cache is not None
+            and existing_cache.get("cached_at") == today_iso
+        )
+
+        # Two sets of accumulators to avoid double-counting:
+        #   old_*   — files with mtime < thirty_days_ago (saved to / loaded from cache)
+        #   fresh_* — files with mtime >= thirty_days_ago (always re-read)
+        # merged_* = old_* + fresh_* with no overlap.
+        fresh_daily_activity: Dict[str, int] = {}
+        fresh_tokens_by_model_by_day: Dict[str, Any] = {}
+        fresh_sessions: list = []   # session durations (seconds) from recent files
+        old_sessions: list = []     # session durations (seconds) from old files (stale-cache run only)
+
+        # ------------------------------------------------------------------
+        # Parse JSONL files
+        # ------------------------------------------------------------------
         try:
             for jsonl in projects_dir.glob("**/*.jsonl"):
                 try:
                     mtime = datetime.fromtimestamp(jsonl.stat().st_mtime).date()
                 except OSError:
                     continue
-                # Skip files that are definitely too old (performance optimisation only)
-                if mtime < thirty_days_ago:
+
+                # When the cache is valid, skip files that are clearly outside
+                # the 30-day window (file mtime older than thirty_days_ago).
+                # Their contribution is already baked into the cache.
+                if cache_valid and mtime < thirty_days_ago:
                     continue
 
                 try:
+                    is_old_file = mtime < thirty_days_ago
+                    # Track first/last timestamp per file (1 file = 1 session, matching CC CLI)
+                    file_first_ts = None
+                    file_last_ts = None
+                    # A file is a subagent sidechain if it has no isSidechain:false entry.
+                    # We track whether we've seen at least one non-sidechain message so we
+                    # can exclude pure subagent spawn files from the session count.
+                    file_has_human_turn = False
+
                     with open(jsonl, 'r') as f:
                         for line in f:
                             try:
                                 entry = json.loads(line)
+
+                                # Detect human/main-session turns
+                                if not file_has_human_turn and entry.get("isSidechain") is False:
+                                    file_has_human_turn = True
+
                                 msg = entry.get("message")
                                 if not isinstance(msg, dict):
                                     continue
@@ -492,22 +595,51 @@ class ClaudeCollector:
                                 if not isinstance(usage, dict):
                                     continue
 
-                                # Use per-message timestamp for accurate date classification
+                                # Parse message timestamp
                                 ts = entry.get("timestamp", "")
+                                msg_dt_aware = None
                                 if ts:
                                     try:
-                                        msg_date = datetime.fromisoformat(ts.replace('Z', '+00:00')).date()
+                                        msg_dt_aware = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                                        msg_date = msg_dt_aware.date()
                                     except Exception:
                                         msg_date = mtime
                                 else:
                                     msg_date = mtime
 
+                                inp = usage.get("input_tokens", 0)
+                                out = usage.get("output_tokens", 0)
+                                total = inp + out
+                                model = msg.get("model", "")
+                                display = _format_model_name(model) if model else ""
+
+                                # --- All-time stats (no date filter) ---
+                                if total > 0:
+                                    date_key = msg_date.isoformat()
+
+                                    # Daily activity heatmap
+                                    fresh_daily_activity[date_key] = (
+                                        fresh_daily_activity.get(date_key, 0) + total
+                                    )
+
+                                    # Tokens by model by day
+                                    day_models = fresh_tokens_by_model_by_day.setdefault(date_key, {})
+                                    if display:
+                                        m_entry = day_models.setdefault(display, {"input": 0, "output": 0, "total": 0})
+                                        m_entry["input"] += inp
+                                        m_entry["output"] += out
+                                        m_entry["total"] += total
+
+                                    # Track file-level timestamps for session duration
+                                    if msg_dt_aware is not None:
+                                        if file_first_ts is None:
+                                            file_first_ts = msg_dt_aware
+                                        file_last_ts = msg_dt_aware
+
+                                # --- 30-day cost stats (date-gated) ---
                                 if msg_date < thirty_days_ago:
                                     continue
 
-                                inp = usage.get("input_tokens", 0)
-                                out = usage.get("output_tokens", 0)
-                                model = msg.get("model", "")
                                 price = pricing.get_price(model) if model else None
                                 msg_cost = (inp * price["input"] + out * price["output"]) if price else 0.0
                                 is_today = (msg_date == today)
@@ -523,7 +655,6 @@ class ClaudeCollector:
                                     result["cost_today"] += msg_cost
 
                                 if model and (inp + out) > 0:
-                                    display = _format_model_name(model)
                                     b = result["cost_by_model"].setdefault(display, {"input": 0, "output": 0, "cost": 0.0})
                                     b["input"] += inp
                                     b["output"] += out
@@ -535,10 +666,130 @@ class ClaudeCollector:
                                         bt["cost"] += msg_cost
                             except (json.JSONDecodeError, TypeError):
                                 continue
+
+                    # Record this file as one session; bucket by age to avoid double-count
+                    # Skip pure subagent sidechain files (all entries have isSidechain=true)
+                    if file_has_human_turn and file_first_ts is not None and file_last_ts is not None:
+                        duration_s = (file_last_ts - file_first_ts).total_seconds()
+                        if is_old_file:
+                            old_sessions.append(duration_s)
+                        else:
+                            fresh_sessions.append(duration_s)
+
                 except OSError:
                     continue
         except Exception:
             pass
+
+        # ------------------------------------------------------------------
+        # Merge cache + fresh data into the all-time accumulators
+        # ------------------------------------------------------------------
+        if cache_valid:
+            # Cache holds only data from old files (mtime < thirty_days_ago).
+            # fresh_* holds only data from recent files. No overlap → no double-count.
+            cached_daily = existing_cache.get("daily_activity", {})
+            merged_daily = dict(cached_daily)
+            merged_daily.update(fresh_daily_activity)  # fresh wins on any boundary overlap
+
+            cached_tbmd = existing_cache.get("tokens_by_model_by_day", {})
+            merged_tbmd = dict(cached_tbmd)
+            merged_tbmd.update(fresh_tokens_by_model_by_day)  # fresh wins
+
+            # Sessions: cache has old-file sessions, fresh has recent-file sessions
+            merged_sessions = list(existing_cache.get("sessions", [])) + fresh_sessions
+        else:
+            # Stale cache: full scan was done; old_* and fresh_* together cover everything.
+            # Save only old_sessions to cache so future runs don't double-count.
+            merged_daily = fresh_daily_activity  # fresh covered ALL files in this run
+            merged_tbmd = fresh_tokens_by_model_by_day
+            merged_sessions = old_sessions + fresh_sessions
+
+            self._save_stats_cache(
+                daily_activity={k: v for k, v in merged_daily.items()
+                                if k < thirty_days_ago.isoformat()},
+                tokens_by_model_by_day={k: v for k, v in merged_tbmd.items()
+                                        if k < thirty_days_ago.isoformat()},
+                sessions=old_sessions,
+                total_input=0,   # no longer used; totals derived from tbmd
+                total_output=0,
+            )
+
+        # Derive totals from merged_tbmd (immune to accumulator double-counting)
+        total_in = total_out = 0
+        for day_data in merged_tbmd.values():
+            for m_data in day_data.values():
+                total_in += m_data.get("input", 0)
+                total_out += m_data.get("output", 0)
+
+        # Populate all-time fields in result
+        result["stats_daily_activity"] = merged_daily
+        result["stats_tokens_by_model_by_day"] = merged_tbmd
+        result["stats_total_input_tokens"] = total_in
+        result["stats_total_output_tokens"] = total_out
+        result["stats_total_tokens"] = total_in + total_out
+
+        # --- Derived all-time stats ---
+        daily_activity = result["stats_daily_activity"]
+
+        # Active days and most active day
+        if daily_activity:
+            result["stats_active_days"] = len(daily_activity)
+            result["stats_most_active_day"] = max(daily_activity, key=lambda d: daily_activity[d])
+
+            # Total days tracked: from first activity date to today (inclusive)
+            try:
+                first_day = min(daily_activity.keys())
+                first_date = datetime.fromisoformat(first_day).date()
+                result["stats_total_days_tracked"] = (today - first_date).days + 1
+            except Exception:
+                pass
+
+        # Favorite model: highest all-time total tokens
+        tokens_by_model: Dict[str, int] = {}
+        for day_models in result["stats_tokens_by_model_by_day"].values():
+            for model_name, counts in day_models.items():
+                tokens_by_model[model_name] = tokens_by_model.get(model_name, 0) + counts.get("total", 0)
+        if tokens_by_model:
+            result["stats_favorite_model"] = max(tokens_by_model, key=lambda m: tokens_by_model[m])
+
+        # Sessions: 1 JSONL file = 1 session (matches CC CLI definition)
+        if merged_sessions:
+            result["stats_session_count"] = len(merged_sessions)
+            result["stats_longest_session_seconds"] = int(max(merged_sessions))
+
+        # Streak calculation using daily_activity keys
+        if daily_activity:
+            try:
+                active_dates = sorted(
+                    datetime.fromisoformat(d).date() for d in daily_activity.keys()
+                )
+
+                # Longest streak
+                longest = 1
+                current_run = 1
+                for i in range(1, len(active_dates)):
+                    if (active_dates[i] - active_dates[i - 1]).days == 1:
+                        current_run += 1
+                        if current_run > longest:
+                            longest = current_run
+                    else:
+                        current_run = 1
+                result["stats_longest_streak_days"] = longest
+
+                # Current streak: consecutive days ending on today or yesterday
+                streak = 0
+                check = today
+                # Allow streak to include yesterday if today has no activity yet
+                if check not in set(active_dates):
+                    check = today - timedelta(days=1)
+
+                active_set = set(active_dates)
+                while check in active_set:
+                    streak += 1
+                    check -= timedelta(days=1)
+                result["stats_current_streak_days"] = streak
+            except Exception:
+                pass
 
 
 class CodexCollector:

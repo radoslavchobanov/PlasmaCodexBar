@@ -16,11 +16,14 @@ PlasmoidItem {
     // All provider data keyed by provider_id
     property var providerDataMap: ({})
     property string currentTab: ""
+    property string viewMode: "usage"
     property bool loading: true
     property string lastError: ""
     property int defaultRefreshMs: Plasmoid.configuration.refreshInterval * 1000 || 300000
     property int rateLimitedRefreshMs: 1800000
     property int refreshMs: defaultRefreshMs
+
+    onCurrentTabChanged: viewMode = "usage"
 
     // Provider registry: id -> { name, icon, dashboard, status }
     readonly property var providerMeta: ({
@@ -236,6 +239,38 @@ PlasmoidItem {
                 }
             }
 
+            // Usage / Stats toggle pills (Claude only)
+            RowLayout {
+                Layout.alignment: Qt.AlignHCenter
+                visible: root.currentTab === "claude" && !root.loading && root.enabledList.length > 0
+                spacing: 4
+
+                Repeater {
+                    model: [
+                        { label: "Usage", value: "usage" },
+                        { label: "Stats", value: "stats" }
+                    ]
+
+                    Rectangle {
+                        required property var modelData
+                        width: 60; height: 24; radius: 12
+                        color: root.viewMode === modelData.value ? Kirigami.Theme.highlightColor : Qt.rgba(0.5, 0.5, 0.5, 0.15)
+
+                        PlasmaComponents.Label {
+                            anchors.centerIn: parent
+                            text: modelData.label
+                            font.pointSize: Kirigami.Theme.smallFont.pointSize
+                            color: root.viewMode === modelData.value ? Kirigami.Theme.highlightedTextColor : Kirigami.Theme.textColor
+                        }
+
+                        MouseArea {
+                            anchors.fill: parent
+                            onClicked: root.viewMode = modelData.value
+                        }
+                    }
+                }
+            }
+
             // Loading indicator
             PlasmaComponents.BusyIndicator {
                 Layout.alignment: Qt.AlignCenter
@@ -267,7 +302,7 @@ PlasmoidItem {
                 id: providerView
                 Layout.fillWidth: true
                 Layout.fillHeight: true
-                visible: !root.loading && root.enabledList.length > 0
+                visible: !root.loading && root.enabledList.length > 0 && (root.viewMode === "usage" || root.currentTab !== "claude")
 
                 providerData: root.providerDataMap[root.currentTab] || null
                 providerName: {
@@ -286,6 +321,14 @@ PlasmoidItem {
                     var meta = root.providerMeta[root.currentTab]
                     return meta ? meta.status : ""
                 }
+            }
+
+            // Stats view (Claude only)
+            StatsView {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                visible: !root.loading && root.enabledList.length > 0 && root.viewMode === "stats" && root.currentTab === "claude"
+                providerData: root.providerDataMap[root.currentTab] || null
             }
         }
     }
