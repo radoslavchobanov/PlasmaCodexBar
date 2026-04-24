@@ -97,6 +97,14 @@ ColumnLayout {
         return Qt.rgba(r, g, b, alphas[level])
     }
 
+    function formatTokens(t) {
+        if (!t || t <= 0) return "0"
+        if (t >= 1000000000) return (t / 1000000000).toFixed(1) + "B"
+        if (t >= 1000000) return (t / 1000000).toFixed(1) + "m"
+        if (t >= 1000) return (t / 1000).toFixed(1) + "k"
+        return Math.round(t).toString()
+    }
+
     // Resolved once at QML level so Canvas onPaint gets a plain color value
     readonly property color _textColor: Kirigami.Theme.textColor
 
@@ -291,7 +299,7 @@ ColumnLayout {
                     var t = heatmapCanvas.hoveredTokens
                     if (!d) return ""
                     var tokenStr = t > 0
-                        ? t.toLocaleString() + " tokens"
+                        ? root.formatTokens(t) + " tokens"
                         : "No activity"
                     return d + "\n" + tokenStr
                 }
